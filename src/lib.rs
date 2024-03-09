@@ -1,8 +1,7 @@
 use std::{
-    cell::UnsafeCell,
     future::Future,
     marker::PhantomData,
-    mem,
+    mem::{self, offset_of},
     pin::Pin,
     ptr::NonNull,
     sync::{
@@ -89,7 +88,7 @@ where
                 this.tasks.push(SubTask {
                     state: TaskState {
                         lock: AtomicBool::new(true),
-                        inner: UnsafeCell::new(InnerTaskState {
+                        inner: Mutex::new(InnerTaskState {
                             future: Box::into_pin(task),
                             scope_waker: cx.waker().clone(),
                             waker: None,
@@ -100,44 +99,58 @@ where
                     wake: true,
                 });
             }
-            for (i, task) in this.tasks.iter_mut().enumerate() {
-                task.runner_handle = Some(Ex::spawn(ScopedTaskRunner {
-                    state: (&mut task.state).into(),
-                    tx: this.tx.clone(),
-                    idx: i,
-                    done: false,
-                }));
+            let task_ptr = this.tasks.as_mut_ptr();
+            for i in 0..this.tasks.len() {
+                unsafe {
+                    let task = task_ptr.add(i);
+                    (*task).runner_handle = Some(Ex::spawn(ScopedTaskRunner {
+                        state: NonNull::new_unchecked(
+                            task.byte_add(offset_of!(SubTask<Ex::TaskHandle<()>>, state))
+                                .cast::<TaskState>(),
+                        ),
+                        tx: this.tx.clone(),
+                        idx: i,
+                        done: false,
+                    }))
+                };
             }
         } else {
             while let Ok(idx) = this.rx.try_recv() {
-                this.tasks[idx].wake = true;
+                unsafe { (*this.tasks.as_mut_ptr().add(idx)).wake = true };
             }
-            for task in this.tasks.iter_mut() {
-                if !task.wake {
+            let task_ptr = this.tasks.as_mut_ptr();
+            for i in 0..this.tasks.len() {
+                let task = unsafe { task_ptr.add(i) };
+                if !unsafe { (*task).wake } {
                     continue;
                 }
                 // If there is no waker here, the runner may have panicked
-                if let Some(waker) =
-                    unsafe { task.state.inner.get().as_mut().unwrap().waker.take() }
-                {
+                let mut state = unsafe { (*task).state.inner.lock().unwrap() };
+                if let Some(waker) = state.waker.take() {
+                    // I think we already do this on line 120
+                    // unsafe { (*task).wake = true };
+                    state.scope_waker.clone_from(cx.waker());
+                    unsafe { (*task).state.lock.store(true, Ordering::Release) };
+                    drop(state);
                     waker.wake();
-                    task.wake = true;
-                    task.state.lock.store(true, Ordering::Release);
                 }
             }
         }
         let mut waiting_for = this.tasks.iter().filter(|task| task.wake).count();
         while waiting_for > 0 {
-            for task in this.tasks.iter_mut() {
-                if !task.wake {
+            let task_ptr = this.tasks.as_mut_ptr();
+            for i in 0..this.tasks.len() {
+                let task = unsafe { task_ptr.add(i) };
+                if unsafe { !(*task).wake } {
                     continue;
                 }
-                while task.state.lock.load(Ordering::Acquire) {
+                while unsafe { (*task).state.lock.load(Ordering::Acquire) } {
                     // You spin me right round, baby, right round
+                    std::hint::spin_loop();
                 }
-                task.wake = false;
+                unsafe { (*task).wake = false };
                 waiting_for -= 1;
-                if unsafe { task.state.inner.get().as_ref().unwrap().done } {
+                if unsafe { (*task).state.inner.lock().unwrap().done } {
                     this.tasks_done += 1;
                 }
             }
@@ -218,7 +231,7 @@ struct TaskState {
     // allowed to access the guarded state, and `false` when the ScopeGuard is allowed to access
     // the state.
     lock: AtomicBool,
-    inner: UnsafeCell<InnerTaskState>,
+    inner: Mutex<InnerTaskState>,
 }
 
 struct InnerTaskState {
@@ -249,11 +262,11 @@ impl Future for ScopedTaskRunner {
         if unsafe { self.state.as_ref().lock.load(Ordering::Acquire) } {
             let ret = {
                 let this = self.as_mut().get_mut();
-                let state = unsafe { this.state.as_ref().inner.get().as_mut().unwrap_unchecked() };
+                let mut state = unsafe { this.state.as_ref().inner.lock().unwrap() };
+                let waker = scoped_task_waker(state.scope_waker.clone(), this.tx.clone(), this.idx);
                 let future = state.future.as_mut();
                 // FIXME: Panic propogation?
                 // FIXME: Release the lock on panic?
-                let waker = scoped_task_waker(state.scope_waker.clone(), this.tx.clone(), this.idx);
                 let ret = future.poll(&mut Context::from_waker(&waker));
                 state.waker = Some(cx.waker().clone());
                 state.done = ret.is_ready();
@@ -346,8 +359,17 @@ mod tests {
         })
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_evil_fanout() {
+    fn mt_block_on(future: impl Future<Output = ()>) {
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        rt.block_on(future);
+        // Silence spurious Miri deadlock warnings caused by `tokio` runtime cleanup.
+        // Requires running Miri with `MIRIFLAGS=-Zmiri-ignore-leaks`.
+        #[cfg(miri)]
+        mem::forget(rt);
+    }
+
+    #[test]
+    fn test_evil_fanout() {
         async fn evil_fanout(data: &mut Vec<i32>) {
             {
                 let my_scope = scoped(data);
@@ -368,18 +390,21 @@ mod tests {
                 data.push(2);
             }
         }
-
-        let mut data = vec![1, 3, 5, 7];
-        evil_fanout(&mut data).await;
-        // We only polled once, which means the subtasks only got polled once, which means the
-        // subtasks didn't get around to mutating the data.
-        assert_eq!(data, vec![1, 3, 5, 7, 2]);
+        mt_block_on(async {
+            let mut data = vec![1, 3, 5, 7];
+            evil_fanout(&mut data).await;
+            // We only polled once, which means the subtasks only got polled once, which means the
+            // subtasks didn't get around to mutating the data.
+            assert_eq!(data, vec![1, 3, 5, 7, 2]);
+        })
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_normal_fanout() {
-        let mut data = [1, 2, 3, 4];
-        scoped(&mut data).await;
-        assert_eq!(data, [2, 3, 5, 6]);
+    #[test]
+    fn test_normal_fanout() {
+        mt_block_on(async {
+            let mut data = [1, 2, 3, 4];
+            scoped(&mut data).await;
+            assert_eq!(data, [2, 3, 5, 6]);
+        })
     }
 }
