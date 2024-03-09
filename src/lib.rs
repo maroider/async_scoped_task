@@ -85,7 +85,7 @@ where
         let n_tasks_to_spawn = this.tasks_to_spawn.len();
         if n_tasks_to_spawn > 0 {
             this.tasks.reserve(n_tasks_to_spawn);
-            for (i, task) in this.tasks_to_spawn.drain(..).enumerate() {
+            for task in this.tasks_to_spawn.drain(..) {
                 this.tasks.push(SubTask {
                     state: TaskState {
                         lock: AtomicBool::new(true),
@@ -99,7 +99,8 @@ where
                     runner_handle: None,
                     wake: true,
                 });
-                let task = this.tasks.last_mut().unwrap();
+            }
+            for (i, task) in this.tasks.iter_mut().enumerate() {
                 task.runner_handle = Some(Ex::spawn(ScopedTaskRunner {
                     state: (&mut task.state).into(),
                     tx: this.tx.clone(),
