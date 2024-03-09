@@ -327,27 +327,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_evil_fanout() {
+    fn scoped(data: &mut [i32]) -> ScopeGuard<'_, TokioExecutor> {
+        scope::<TokioExecutor, _>(|s| {
+            let split_at = data.len() / 2;
+            let (left, right) = data.split_at_mut(split_at);
+            s.spawn(async {
+                tokio::task::yield_now().await;
+                for n in left.iter_mut() {
+                    *n += 1;
+                }
+            });
+            s.spawn(async {
+                tokio::task::yield_now().await;
+                for n in right.iter_mut() {
+                    *n += 2;
+                }
+            });
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_evil_fanout() {
         async fn evil_fanout(data: &mut Vec<i32>) {
             {
-                let my_scope = scope::<TokioExecutor, _>(|s| {
-                    s.spawn(async {
-                        tokio::task::yield_now().await;
-                        data.push(1);
-                    });
-                    s.spawn(async {
-                        tokio::task::yield_now().await;
-                    });
-                });
+                let my_scope = scoped(data);
                 // Once awaited, the scope will spawn all but the first task onto the runtime, and
                 // then poll the first task itself. `Scope::poll` will only yield once its child
                 // tasks have all yielded.
                 let mut scope = Box::pin(my_scope);
                 let _ = futures::poll!(&mut scope);
 
-                // E501: Cannot borrow data as mutable because previous closure
-                // requires unique access
+                // E499: Cannot borrow `*data` as mutable more than once at a time
                 // data.push(0);
 
                 // This will invalidate `scope`'s borrow of `data`. Since the child tasks may only
@@ -359,12 +369,17 @@ mod tests {
             }
         }
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         let mut data = vec![1, 3, 5, 7];
-        runtime.block_on(evil_fanout(&mut data));
+        evil_fanout(&mut data).await;
+        // We only polled once, which means the subtasks only got polled once, which means the
+        // subtasks didn't get around to mutating the data.
         assert_eq!(data, vec![1, 3, 5, 7, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_normal_fanout() {
+        let mut data = [1, 2, 3, 4];
+        scoped(&mut data).await;
+        assert_eq!(data, [2, 3, 5, 6]);
     }
 }
