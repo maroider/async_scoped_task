@@ -1,4 +1,5 @@
 use std::{
+    cell::UnsafeCell,
     future::Future,
     marker::PhantomData,
     mem::{self, offset_of},
@@ -88,7 +89,7 @@ where
                 this.tasks.push(SubTask {
                     state: TaskState {
                         lock: AtomicBool::new(true),
-                        inner: Mutex::new(InnerTaskState {
+                        inner: UnsafeCell::new(InnerTaskState {
                             future: Box::into_pin(task),
                             scope_waker: cx.waker().clone(),
                             waker: None,
@@ -125,13 +126,12 @@ where
                     continue;
                 }
                 // If there is no waker here, the runner may have panicked
-                let mut state = unsafe { (*task).state.inner.lock().unwrap() };
+                let state = unsafe { (*task).state.inner.get().as_mut().unwrap() };
                 if let Some(waker) = state.waker.take() {
                     // I think we already do this on line 120
                     // unsafe { (*task).wake = true };
                     state.scope_waker.clone_from(cx.waker());
                     unsafe { (*task).state.lock.store(true, Ordering::Release) };
-                    drop(state);
                     waker.wake();
                 }
             }
@@ -150,7 +150,7 @@ where
                 }
                 unsafe { (*task).wake = false };
                 waiting_for -= 1;
-                if unsafe { (*task).state.inner.lock().unwrap().done } {
+                if unsafe { (*task).state.inner.get().as_mut().unwrap().done } {
                     this.tasks_done += 1;
                 }
             }
@@ -231,7 +231,7 @@ struct TaskState {
     // allowed to access the guarded state, and `false` when the ScopeGuard is allowed to access
     // the state.
     lock: AtomicBool,
-    inner: Mutex<InnerTaskState>,
+    inner: UnsafeCell<InnerTaskState>,
 }
 
 struct InnerTaskState {
@@ -262,7 +262,7 @@ impl Future for ScopedTaskRunner {
         if unsafe { self.state.as_ref().lock.load(Ordering::Acquire) } {
             let ret = {
                 let this = self.as_mut().get_mut();
-                let mut state = unsafe { this.state.as_ref().inner.lock().unwrap() };
+                let state = unsafe { this.state.as_ref().inner.get().as_mut().unwrap() };
                 let waker = scoped_task_waker(state.scope_waker.clone(), this.tx.clone(), this.idx);
                 let future = state.future.as_mut();
                 // FIXME: Panic propogation?
