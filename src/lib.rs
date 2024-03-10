@@ -3,12 +3,14 @@ use std::{
     marker::PhantomData,
     mem,
     pin::Pin,
-    sync::{mpsc, Arc, Mutex, RwLock, Weak},
+    sync::{mpsc, Arc, Mutex, Weak},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 use maybe_dangling::ManuallyDrop;
 use slab::Slab;
+
+use special_lock::{SpecialRwLock, WriteHandle};
 
 // TODO: Panic propogation
 // TODO: Return values
@@ -44,7 +46,8 @@ where
     Ex: Executor,
 {
     _phantom: PhantomData<&'scope ()>,
-    inner: Arc<RwLock<InnerScopeGuard<Ex>>>,
+    inner: Arc<SpecialRwLock<InnerScopeGuard<Ex>>>,
+    inner_write: WriteHandle,
     to_spawn: Vec<(usize, ScopedTaskRunner<Ex>)>,
     spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     task_wake_rx: mpsc::Receiver<usize>,
@@ -83,7 +86,7 @@ struct ScopedTaskRunner<Ex>
 where
     Ex: Executor,
 {
-    scope: Weak<RwLock<InnerScopeGuard<Ex>>>,
+    scope: Weak<SpecialRwLock<InnerScopeGuard<Ex>>>,
     idx: usize,
     done: bool,
 }
@@ -139,15 +142,19 @@ where
     ) -> Self {
         let (task_done_tx, task_done_rx) = mpsc::channel();
         let (task_wake_tx, task_wake_rx) = mpsc::channel();
-        Self {
-            _phantom: PhantomData,
-            inner: Arc::new(RwLock::new(InnerScopeGuard {
+        let (inner, inner_write) = unsafe {
+            SpecialRwLock::new(InnerScopeGuard {
                 can_run: false,
                 tasks: Slab::new(),
                 scope_waker: None,
                 task_wake_tx,
                 task_done_tx,
-            })),
+            })
+        };
+        Self {
+            _phantom: PhantomData,
+            inner: Arc::new(inner),
+            inner_write,
             to_spawn: Vec::new(),
             spawn_rx,
             task_wake_rx,
@@ -169,7 +176,7 @@ where
     ) -> std::task::Poll<Self::Output> {
         let this = self.as_mut().get_mut();
         // The lock can only be poisoned in the current scope.
-        let mut inner = this.inner.write().unwrap();
+        let inner = this.inner_write.write(&this.inner);
         inner.scope_waker = Some(cx.waker().clone());
 
         let mut wakers = Vec::new();
@@ -181,8 +188,8 @@ where
         }
 
         inner.can_run = true;
-        drop(inner);
-        let inner = this.inner.read().unwrap();
+        let num_readers = wakers.len() + this.to_spawn.len();
+        let allow_reads = this.inner_write.allow_reads(&this.inner, num_readers);
         // Dispatch subtasks
         for waker in wakers {
             waker.wake();
@@ -191,12 +198,9 @@ where
         for (idx, runner) in this.to_spawn.drain(..) {
             runner_handles.push((idx, Ex::spawn(runner)));
         }
-        // Sleep a tiny amount to give subtasks a chance to acquire a read lock.
-        // FIXME: Factor this out
-        std::thread::sleep(std::time::Duration::from_millis(10));
         // Block the thread until all subtasks are done polling their futures.
-        drop(inner);
-        let mut inner = this.inner.write().unwrap();
+        drop(allow_reads);
+        let inner = this.inner_write.write(&this.inner);
         inner.can_run = false;
 
         for (idx, handle) in runner_handles {
@@ -224,12 +228,10 @@ where
         for idx in this.task_done_rx.try_iter() {
             inner.tasks.remove(idx);
         }
-        this.to_spawn.len();
         if !this.to_spawn.is_empty() {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        inner.tasks.len();
         if !inner.tasks.is_empty() {
             return Poll::Pending;
         }
@@ -242,7 +244,7 @@ where
     Ex: Executor,
 {
     fn drop(&mut self) {
-        let mut inner = self.inner.write().unwrap();
+        let inner = self.inner_write.write(&self.inner);
         for (_, task) in inner.tasks.iter_mut() {
             let task = task.get_mut().unwrap();
             if let Some(runner_handle) = task.runner_handle.as_ref() {
@@ -265,25 +267,26 @@ where
             panic!("Polled ScopedTaskRuner after it completed");
         }
         if let Some(scope) = self.scope.upgrade() {
-            let scope = scope.read().unwrap();
-            let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
-            task.waker = Some(cx.waker().clone());
-            if scope.can_run {
-                // SAFETY: `can_run` signals that it's safe to access the future.
-                let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
-                let poll = future
-                    .as_mut()
-                    .poll(&mut Context::from_waker(&scoped_task_waker(
-                        scope.scope_waker.as_ref().unwrap().clone(),
-                        scope.task_wake_tx.clone(),
-                        self.idx,
-                    )));
-                task.future = ManuallyDrop::new(Some(future));
-                if poll.is_ready() {
-                    let _ = scope.task_done_tx.send(self.idx);
-                    self.done = true;
+            if let Some(scope) = scope.try_read() {
+                let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
+                task.waker = Some(cx.waker().clone());
+                if scope.can_run {
+                    // SAFETY: `can_run` signals that it's safe to access the future.
+                    let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
+                    let poll = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&scoped_task_waker(
+                            scope.scope_waker.as_ref().unwrap().clone(),
+                            scope.task_wake_tx.clone(),
+                            self.idx,
+                        )));
+                    task.future = ManuallyDrop::new(Some(future));
+                    if poll.is_ready() {
+                        let _ = scope.task_done_tx.send(self.idx);
+                        self.done = true;
+                    }
+                    return poll;
                 }
-                return poll;
             }
         }
         Poll::Pending
@@ -325,6 +328,113 @@ fn scoped_task_waker(scope_waker: Waker, tx: mpsc::Sender<usize>, idx: usize) ->
     });
     let raw = RawWaker::new(Arc::into_raw(data).cast(), &VTABLE);
     unsafe { Waker::from_raw(raw) }
+}
+
+mod special_lock {
+    //! A specialized lock just for our use-case
+    //!
+    //! It lets us write by default with a `WriteHandle`, and then we can optionally give read
+    //! access for a limited time with `WriteHandle::allow_reads()` to a known number of readers.
+    //! We're only given back access to our `WriteHandle` once all readers have dropped their read
+    //! guards. This will deadlock if any reader fails to create and subsequently drop their
+    //! alloted read guard.
+    //!
+    //! TODO: Think of some alternate shceme that avoid this potential deadlock.
+
+    use std::{
+        cell::UnsafeCell,
+        ops::{Deref, DerefMut},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    pub struct SpecialRwLock<T> {
+        item: UnsafeCell<T>,
+        readers: AtomicUsize,
+    }
+
+    pub struct ReadableSpecialRwLock<'a, T> {
+        inner: &'a SpecialRwLock<T>,
+        _handle: &'a mut WriteHandle,
+    }
+
+    pub struct SpecialRwLockReadGuard<'a, T> {
+        inner: &'a SpecialRwLock<T>,
+    }
+
+    pub struct WriteHandle {}
+
+    impl<T> SpecialRwLock<T> {
+        /// # Safety
+        ///
+        /// It's the caller's responsibility to make sure they use the returned handles with the lock
+        /// they were created from.
+        pub unsafe fn new(item: T) -> (Self, WriteHandle) {
+            (
+                Self {
+                    item: UnsafeCell::new(item),
+                    readers: AtomicUsize::new(0),
+                },
+                WriteHandle {},
+            )
+        }
+
+        pub fn try_read(&self) -> Option<SpecialRwLockReadGuard<'_, T>> {
+            if self.readers.load(Ordering::Acquire) > 0 {
+                Some(SpecialRwLockReadGuard { inner: self })
+            } else {
+                None
+            }
+        }
+    }
+
+    unsafe impl<T: Send> Send for SpecialRwLock<T> {}
+    unsafe impl<T: Send + Sync> Sync for SpecialRwLock<T> {}
+
+    impl WriteHandle {
+        pub fn write<'a, T>(&'a mut self, lock: &'a SpecialRwLock<T>) -> &'a mut T {
+            unsafe { lock.item.get().as_mut().unwrap() }
+        }
+
+        pub fn allow_reads<'a, T>(
+            &'a mut self,
+            lock: &'a SpecialRwLock<T>,
+            num_readers: usize,
+        ) -> ReadableSpecialRwLock<'a, T> {
+            lock.readers.store(num_readers, Ordering::Release);
+            ReadableSpecialRwLock {
+                inner: lock,
+                _handle: self,
+            }
+        }
+    }
+
+    impl<'a, T> Drop for ReadableSpecialRwLock<'a, T> {
+        fn drop(&mut self) {
+            while self.inner.readers.load(Ordering::Acquire) > 0 {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    impl<'a, T> Deref for SpecialRwLockReadGuard<'a, T> {
+        type Target = T;
+
+        fn deref(&self) -> &Self::Target {
+            unsafe { self.inner.item.get().as_ref().unwrap() }
+        }
+    }
+
+    impl<'a, T> DerefMut for SpecialRwLockReadGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            unsafe { self.inner.item.get().as_mut().unwrap() }
+        }
+    }
+
+    impl<'a, T> Drop for SpecialRwLockReadGuard<'a, T> {
+        fn drop(&mut self) {
+            self.inner.readers.fetch_sub(1, Ordering::Release);
+        }
+    }
 }
 
 #[cfg(test)]
