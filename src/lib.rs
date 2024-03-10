@@ -1,16 +1,19 @@
 use std::{
-    cell::UnsafeCell,
     future::Future,
     marker::PhantomData,
-    mem::{self, offset_of},
+    mem,
     pin::Pin,
-    ptr::NonNull,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
-    },
+    sync::{mpsc, Arc, Mutex, RwLock, Weak},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
+
+use maybe_dangling::ManuallyDrop;
+use slab::Slab;
+
+// TODO: Panic propogation
+// TODO: Return values
+// TODO: Allow the spawning of subtasks within subtasks from the same scope
+// TODO: Let the callback passed to `scope` return a `Future`
 
 /// An executor capable of paralell execution.
 ///
@@ -29,16 +32,11 @@ pub trait TaskHandle {
     fn abort(&self);
 }
 
-#[must_use = "Must .await the ScopeGuard in order to make progress in subtasks"]
-pub fn scope<'env, 'scope, Ex, F>(f: F) -> ScopeGuard<'scope, Ex>
-where
-    'env: 'scope,
-    Ex: Executor,
-    F: FnOnce(&Scope<'scope, 'env, Ex>),
-{
-    let scope = Scope::new();
-    f(&scope);
-    scope.guard.into_inner().unwrap()
+pub struct Scope<'scope, 'env: 'scope> {
+    // *const is so the struct is !Send, since spawning subtasks within a subtask from the Scope
+    // isn't something I want to tackle right now. Using a different inner Scope should be fine.
+    _phantom: PhantomData<*const &'scope &'env ()>,
+    spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }
 
 pub struct ScopeGuard<'scope, Ex>
@@ -46,154 +44,70 @@ where
     Ex: Executor,
 {
     _phantom: PhantomData<&'scope ()>,
-    tasks_to_spawn: Vec<Box<dyn Future<Output = ()>>>,
-    tasks: Vec<SubTask<Ex::TaskHandle<()>>>,
-    tasks_done: usize,
-    tx: mpsc::Sender<usize>,
-    rx: mpsc::Receiver<usize>,
+    inner: Arc<RwLock<InnerScopeGuard<Ex>>>,
+    to_spawn: Vec<(usize, ScopedTaskRunner<Ex>)>,
+    spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    task_wake_rx: mpsc::Receiver<usize>,
+    task_done_rx: mpsc::Receiver<usize>,
 }
 
-impl<'scope, Ex> ScopeGuard<'scope, Ex>
+struct InnerScopeGuard<Ex>
 where
     Ex: Executor,
 {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
+    // When this field is `true`, it signals to `ScopedTaskRunner`s that they may access and run
+    // their futures. We set it to `true` when we enter the body of `<ScopeGuard as Future>::poll`,
+    // and set it to `false` when we exit the function. Additionally, we make sure to block the
+    // thread until all tasks have yielded back to their `ScopedTaskRunner`.
+    can_run: bool,
+    tasks: Slab<Mutex<SubTask<Ex::TaskHandle<()>>>>,
+    // This is only an `Option` because of delayed initialization. If we wanted to, we could
+    // initialize it with a no-op waker, but I can't be arsed since there's no stable way to do
+    // it in the standard library.
+    scope_waker: Option<Waker>,
+    task_wake_tx: mpsc::Sender<usize>,
+    task_done_tx: mpsc::Sender<usize>,
+}
+
+struct SubTask<H> {
+    // SAFETY: Accessing this field may be UB if the non-'static data this future borrows from is
+    // invalidated. Therefore, we don't touch it unless `InnerScopeGuard.can_run` is `true`.
+    future: ManuallyDrop<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
+    // Wakes the associated `ScopedTaskRunner`
+    waker: Option<Waker>,
+    runner_handle: Option<H>,
+}
+
+/// The future spawned directly onto the runtime.
+struct ScopedTaskRunner<Ex>
+where
+    Ex: Executor,
+{
+    scope: Weak<RwLock<InnerScopeGuard<Ex>>>,
+    idx: usize,
+    done: bool,
+}
+
+#[must_use = "Must .await the ScopeGuard in order to make progress in subtasks"]
+pub fn scope<'env, 'scope, Ex, F>(f: F) -> ScopeGuard<'scope, Ex>
+where
+    'env: 'scope,
+    Ex: Executor,
+    F: FnOnce(&Scope<'scope, 'env>),
+{
+    let (tx, rx) = mpsc::channel();
+    let scope = Scope::new(tx);
+    f(&scope);
+    ScopeGuard::new(rx)
+}
+
+impl<'scope, 'env> Scope<'scope, 'env> {
+    fn new(
+        spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    ) -> Scope<'scope, 'env> {
         Self {
             _phantom: PhantomData,
-            tasks_to_spawn: Vec::new(),
-            tasks: Vec::new(),
-            tasks_done: 0,
-            tx,
-            rx,
-        }
-    }
-}
-
-impl<'scope, Ex> Future for ScopeGuard<'scope, Ex>
-where
-    Ex: Executor,
-    Ex::TaskHandle<()>: Unpin,
-{
-    type Output = ();
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.as_mut().get_mut();
-        let n_tasks_to_spawn = this.tasks_to_spawn.len();
-        if n_tasks_to_spawn > 0 {
-            this.tasks.reserve(n_tasks_to_spawn);
-            for task in this.tasks_to_spawn.drain(..) {
-                this.tasks.push(SubTask {
-                    state: TaskState {
-                        lock: AtomicBool::new(true),
-                        inner: UnsafeCell::new(InnerTaskState {
-                            future: Box::into_pin(task),
-                            scope_waker: cx.waker().clone(),
-                            waker: None,
-                            done: false,
-                        }),
-                    },
-                    runner_handle: None,
-                    wake: true,
-                });
-            }
-            let task_ptr = this.tasks.as_mut_ptr();
-            for i in 0..this.tasks.len() {
-                unsafe {
-                    let task = task_ptr.add(i);
-                    (*task).runner_handle = Some(Ex::spawn(ScopedTaskRunner {
-                        state: NonNull::new_unchecked(
-                            task.byte_add(offset_of!(SubTask<Ex::TaskHandle<()>>, state))
-                                .cast::<TaskState>(),
-                        ),
-                        tx: this.tx.clone(),
-                        idx: i,
-                        done: false,
-                    }))
-                };
-            }
-        } else {
-            while let Ok(idx) = this.rx.try_recv() {
-                unsafe { (*this.tasks.as_mut_ptr().add(idx)).wake = true };
-            }
-            let task_ptr = this.tasks.as_mut_ptr();
-            for i in 0..this.tasks.len() {
-                let task = unsafe { task_ptr.add(i) };
-                if !unsafe { (*task).wake } {
-                    continue;
-                }
-                // If there is no waker here, the runner may have panicked
-                let state = unsafe { (*task).state.inner.get().as_mut().unwrap() };
-                if let Some(waker) = state.waker.take() {
-                    // I think we already do this on line 120
-                    // unsafe { (*task).wake = true };
-                    state.scope_waker.clone_from(cx.waker());
-                    unsafe { (*task).state.lock.store(true, Ordering::Release) };
-                    waker.wake();
-                }
-            }
-        }
-        let mut waiting_for = this.tasks.iter().filter(|task| task.wake).count();
-        while waiting_for > 0 {
-            let task_ptr = this.tasks.as_mut_ptr();
-            for i in 0..this.tasks.len() {
-                let task = unsafe { task_ptr.add(i) };
-                if unsafe { !(*task).wake } {
-                    continue;
-                }
-                while unsafe { (*task).state.lock.load(Ordering::Acquire) } {
-                    // You spin me right round, baby, right round
-                    std::hint::spin_loop();
-                }
-                unsafe { (*task).wake = false };
-                waiting_for -= 1;
-                if unsafe { (*task).state.inner.get().as_mut().unwrap().done } {
-                    this.tasks_done += 1;
-                }
-            }
-        }
-        if this.tasks_done == this.tasks.len() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-impl<'scope, Ex> Drop for ScopeGuard<'scope, Ex>
-where
-    Ex: Executor,
-{
-    fn drop(&mut self) {
-        for task in self.tasks.iter() {
-            if let Some(runner_handle) = task.runner_handle.as_ref() {
-                runner_handle.abort();
-            }
-        }
-    }
-}
-
-pub struct Scope<'scope, 'env: 'scope, Ex>
-where
-    Ex: Executor,
-{
-    // *const is so the struct is !Send, since spawning subtasks within a subtask from the Scope
-    // isn't something I want to tackle right now. Using a different inner Scope should be fine.
-    _phantom: PhantomData<*const &'scope &'env ()>,
-    guard: Mutex<ScopeGuard<'scope, Ex>>,
-}
-
-impl<'scope, 'env, Ex> Scope<'scope, 'env, Ex>
-where
-    Ex: Executor,
-{
-    fn new() -> Scope<'scope, 'env, Ex> {
-        Self {
-            _phantom: PhantomData,
-            guard: Mutex::new(ScopeGuard::new()),
+            spawn_tx,
         }
     }
 
@@ -204,80 +118,175 @@ where
     {
         let fut = Box::new(async {
             fut.await;
-            // FIXME: Do something with the output of the future instead of throwing it away
-        }) as Box<dyn Future<Output = ()>>;
-        // SAFETY: The 'scope lifetime is enforced by ... this entire module, really.
+        });
+        // SAFETY: The rest of this module makes sure to only deref the `Box` when we're certain
+        // that the 'scope borrow is still live/valid.
         let fut = unsafe {
-            mem::transmute::<
-                Box<dyn Future<Output = ()> + 'scope>,
-                Box<dyn Future<Output = ()> + 'static>,
-            >(fut)
+            ManuallyDrop::new(Box::from_raw(
+                Box::into_raw(fut) as *mut (dyn Future<Output = ()> + Send + 'static)
+            ))
         };
-        self.guard.lock().unwrap().tasks_to_spawn.push(fut);
+        let _ = self.spawn_tx.send(fut);
     }
 }
 
-struct SubTask<H> {
-    state: TaskState,
-    runner_handle: Option<H>,
-    wake: bool,
+impl<'scope, Ex> ScopeGuard<'scope, Ex>
+where
+    Ex: Executor,
+{
+    fn new(
+        spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    ) -> Self {
+        let (task_done_tx, task_done_rx) = mpsc::channel();
+        let (task_wake_tx, task_wake_rx) = mpsc::channel();
+        Self {
+            _phantom: PhantomData,
+            inner: Arc::new(RwLock::new(InnerScopeGuard {
+                can_run: false,
+                tasks: Slab::new(),
+                scope_waker: None,
+                task_wake_tx,
+                task_done_tx,
+            })),
+            to_spawn: Vec::new(),
+            spawn_rx,
+            task_wake_rx,
+            task_done_rx,
+        }
+    }
 }
 
-unsafe impl<H> Send for SubTask<H> {}
+impl<'scope, Ex> Future for ScopeGuard<'scope, Ex>
+where
+    Ex: Executor + 'static,
+    <Ex as Executor>::TaskHandle<()>: Unpin + Send,
+{
+    type Output = ();
 
-struct TaskState {
-    // Since the executor may poll the ScopedTaskRunner as it pleases, we have to guard against the
-    // runtime polling us at the wrong time. The "lock" is `true` when the ScopedTaskRunner is
-    // allowed to access the guarded state, and `false` when the ScopeGuard is allowed to access
-    // the state.
-    lock: AtomicBool,
-    inner: UnsafeCell<InnerTaskState>,
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        // The lock can only be poisoned in the current scope.
+        let mut inner = this.inner.write().unwrap();
+        inner.scope_waker = Some(cx.waker().clone());
+
+        let mut wakers = Vec::new();
+        for idx in this.task_wake_rx.try_iter() {
+            let task = inner.tasks.get_mut(idx).unwrap().get_mut().unwrap();
+            if let Some(waker) = task.waker.take() {
+                wakers.push(waker);
+            }
+        }
+
+        inner.can_run = true;
+        drop(inner);
+        let inner = this.inner.read().unwrap();
+        // Dispatch subtasks
+        for waker in wakers {
+            waker.wake();
+        }
+        let mut runner_handles = Vec::new();
+        for (idx, runner) in this.to_spawn.drain(..) {
+            runner_handles.push((idx, Ex::spawn(runner)));
+        }
+        // Sleep a tiny amount to give subtasks a chance to acquire a read lock.
+        // FIXME: Factor this out
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Block the thread until all subtasks are done polling their futures.
+        drop(inner);
+        let mut inner = this.inner.write().unwrap();
+        inner.can_run = false;
+
+        for (idx, handle) in runner_handles {
+            let task = inner.tasks.get_mut(idx).unwrap().get_mut().unwrap();
+            task.runner_handle = Some(handle);
+        }
+
+        for task in this.spawn_rx.try_iter() {
+            let entry = inner.tasks.vacant_entry();
+            let idx = entry.key();
+            this.to_spawn.push((
+                idx,
+                ScopedTaskRunner {
+                    scope: Arc::downgrade(&this.inner.clone()),
+                    idx,
+                    done: false,
+                },
+            ));
+            entry.insert(Mutex::new(SubTask {
+                future: ManuallyDrop::new(Some(Box::into_pin(ManuallyDrop::into_inner(task)))),
+                waker: None,
+                runner_handle: None,
+            }));
+        }
+        for idx in this.task_done_rx.try_iter() {
+            inner.tasks.remove(idx);
+        }
+        this.to_spawn.len();
+        if !this.to_spawn.is_empty() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        inner.tasks.len();
+        if !inner.tasks.is_empty() {
+            return Poll::Pending;
+        }
+        Poll::Ready(())
+    }
 }
 
-struct InnerTaskState {
-    future: Pin<Box<dyn Future<Output = ()>>>,
-    scope_waker: Waker,
-    waker: Option<Waker>,
-    done: bool,
+impl<'scope, Ex> Drop for ScopeGuard<'scope, Ex>
+where
+    Ex: Executor,
+{
+    fn drop(&mut self) {
+        let mut inner = self.inner.write().unwrap();
+        for (_, task) in inner.tasks.iter_mut() {
+            let task = task.get_mut().unwrap();
+            if let Some(runner_handle) = task.runner_handle.as_ref() {
+                runner_handle.abort();
+            }
+            // SAFETY: The lifetime on `Self` guards against invalidating the borrow of the futures
+            unsafe { ManuallyDrop::drop(&mut task.future) };
+        }
+    }
 }
 
-/// The future spawned directly onto the runtime.
-struct ScopedTaskRunner {
-    // We're only allowed to access this when `task_fence == true`
-    state: NonNull<TaskState>,
-    tx: mpsc::Sender<usize>,
-    idx: usize,
-    done: bool,
-}
-
-unsafe impl Send for ScopedTaskRunner {}
-
-impl Future for ScopedTaskRunner {
+impl<Ex> Future for ScopedTaskRunner<Ex>
+where
+    Ex: Executor,
+{
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.done {
             panic!("Polled ScopedTaskRuner after it completed");
         }
-        if unsafe { self.state.as_ref().lock.load(Ordering::Acquire) } {
-            let ret = {
-                let this = self.as_mut().get_mut();
-                let state = unsafe { this.state.as_ref().inner.get().as_mut().unwrap() };
-                let waker = scoped_task_waker(state.scope_waker.clone(), this.tx.clone(), this.idx);
-                let future = state.future.as_mut();
-                // FIXME: Panic propogation?
-                // FIXME: Release the lock on panic?
-                let ret = future.poll(&mut Context::from_waker(&waker));
-                state.waker = Some(cx.waker().clone());
-                state.done = ret.is_ready();
-                this.done = ret.is_ready();
-                ret
-            };
-            unsafe { self.state.as_ref().lock.store(false, Ordering::Release) };
-            ret
-        } else {
-            Poll::Pending
+        if let Some(scope) = self.scope.upgrade() {
+            let scope = scope.read().unwrap();
+            let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
+            task.waker = Some(cx.waker().clone());
+            if scope.can_run {
+                // SAFETY: `can_run` signals that it's safe to access the future.
+                let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
+                let poll = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&scoped_task_waker(
+                        scope.scope_waker.as_ref().unwrap().clone(),
+                        scope.task_wake_tx.clone(),
+                        self.idx,
+                    )));
+                task.future = ManuallyDrop::new(Some(future));
+                if poll.is_ready() {
+                    let _ = scope.task_done_tx.send(self.idx);
+                    self.done = true;
+                }
+                return poll;
+            }
         }
+        Poll::Pending
     }
 }
 
