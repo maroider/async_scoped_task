@@ -62,6 +62,7 @@ where
     // their futures. We set it to `true` when we enter the body of `<ScopeGuard as Future>::poll`,
     // and set it to `false` when we exit the function. Additionally, we make sure to block the
     // thread until all tasks have yielded back to their `ScopedTaskRunner`.
+    // TODO: Is it possible to remove this now?
     can_run: bool,
     tasks: Slab<Mutex<SubTask<Ex::TaskHandle<()>>>>,
     // This is only an `Option` because of delayed initialization. If we wanted to, we could
@@ -78,6 +79,7 @@ struct SubTask<H> {
     future: ManuallyDrop<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
     // Wakes the associated `ScopedTaskRunner`
     waker: Option<Waker>,
+    has_ticket: bool,
     runner_handle: Option<H>,
 }
 
@@ -183,6 +185,7 @@ where
         for idx in this.task_wake_rx.try_iter() {
             let task = inner.tasks.get_mut(idx).unwrap().get_mut().unwrap();
             if let Some(waker) = task.waker.take() {
+                task.has_ticket = true;
                 wakers.push(waker);
             }
         }
@@ -222,6 +225,7 @@ where
             entry.insert(Mutex::new(SubTask {
                 future: ManuallyDrop::new(Some(Box::into_pin(ManuallyDrop::into_inner(task)))),
                 waker: None,
+                has_ticket: true,
                 runner_handle: None,
             }));
         }
@@ -285,6 +289,11 @@ where
                         let _ = scope.task_done_tx.send(self.idx);
                         self.done = true;
                     }
+                    if task.has_ticket {
+                        task.has_ticket = false;
+                        drop(task);
+                        scope.consume_ticket();
+                    }
                     return poll;
                 }
             }
@@ -308,14 +317,13 @@ fn scoped_task_waker(scope_waker: Waker, tx: mpsc::Sender<usize>, idx: usize) ->
         },
         |data| {
             let data = unsafe { Arc::from_raw(data.cast::<ScopedTaskWakerData>()) };
-            data.scope_waker.wake_by_ref();
             let _ = data.tx.send(data.idx);
+            data.scope_waker.wake_by_ref();
         },
         |data| {
-            let data = unsafe { Arc::from_raw(data.cast::<ScopedTaskWakerData>()) };
+            let data = unsafe { &*data.cast::<ScopedTaskWakerData>() };
             let _ = data.tx.send(data.idx);
             data.scope_waker.wake_by_ref();
-            let _ = Arc::into_raw(data);
         },
         |data| {
             let _ = unsafe { Arc::from_raw(data.cast::<ScopedTaskWakerData>()) };
@@ -334,12 +342,9 @@ mod special_lock {
     //! A specialized lock just for our use-case
     //!
     //! It lets us write by default with a `WriteHandle`, and then we can optionally give read
-    //! access for a limited time with `WriteHandle::allow_reads()` to a known number of readers.
-    //! We're only given back access to our `WriteHandle` once all readers have dropped their read
-    //! guards. This will deadlock if any reader fails to create and subsequently drop their
-    //! alloted read guard.
-    //!
-    //! TODO: Think of some alternate shceme that avoid this potential deadlock.
+    //! access for a limited time with `WriteHandle::allow_reads()` to a known number of tasks.
+    //! We're only given back access to our `WriteHandle` once all tasks have consumed their read
+    //! tickets.
 
     use std::{
         cell::UnsafeCell,
@@ -349,6 +354,7 @@ mod special_lock {
 
     pub struct SpecialRwLock<T> {
         item: UnsafeCell<T>,
+        read_tickets: AtomicUsize,
         readers: AtomicUsize,
     }
 
@@ -366,12 +372,13 @@ mod special_lock {
     impl<T> SpecialRwLock<T> {
         /// # Safety
         ///
-        /// It's the caller's responsibility to make sure they use the returned handles with the lock
-        /// they were created from.
+        /// It's the caller's responsibility to make sure they use the returned write handle with
+        /// the lock it was created from.
         pub unsafe fn new(item: T) -> (Self, WriteHandle) {
             (
                 Self {
                     item: UnsafeCell::new(item),
+                    read_tickets: AtomicUsize::new(0),
                     readers: AtomicUsize::new(0),
                 },
                 WriteHandle {},
@@ -379,9 +386,11 @@ mod special_lock {
         }
 
         pub fn try_read(&self) -> Option<SpecialRwLockReadGuard<'_, T>> {
-            if self.readers.load(Ordering::Acquire) > 0 {
+            self.readers.fetch_add(1, Ordering::Release);
+            if self.read_tickets.load(Ordering::Acquire) > 0 {
                 Some(SpecialRwLockReadGuard { inner: self })
             } else {
+                self.readers.fetch_sub(1, Ordering::Relaxed);
                 None
             }
         }
@@ -400,7 +409,7 @@ mod special_lock {
             lock: &'a SpecialRwLock<T>,
             num_readers: usize,
         ) -> ReadableSpecialRwLock<'a, T> {
-            lock.readers.store(num_readers, Ordering::Release);
+            lock.read_tickets.store(num_readers, Ordering::Release);
             ReadableSpecialRwLock {
                 inner: lock,
                 _handle: self,
@@ -410,12 +419,19 @@ mod special_lock {
 
     impl<'a, T> Drop for ReadableSpecialRwLock<'a, T> {
         fn drop(&mut self) {
-            while self.inner.readers.load(Ordering::Acquire) > 0 {
+            while self.inner.readers.load(Ordering::Acquire) > 0
+                || self.inner.read_tickets.load(Ordering::Acquire) > 0
+            {
                 std::hint::spin_loop();
             }
         }
     }
 
+    impl<'a, T> SpecialRwLockReadGuard<'a, T> {
+        pub fn consume_ticket(self) {
+            self.inner.read_tickets.fetch_sub(1, Ordering::Release);
+        }
+    }
     impl<'a, T> Deref for SpecialRwLockReadGuard<'a, T> {
         type Target = T;
 
@@ -432,7 +448,7 @@ mod special_lock {
 
     impl<'a, T> Drop for SpecialRwLockReadGuard<'a, T> {
         fn drop(&mut self) {
-            self.inner.readers.fetch_sub(1, Ordering::Release);
+            self.inner.readers.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -520,10 +536,12 @@ mod tests {
 
     #[test]
     fn test_normal_fanout() {
-        mt_block_on(async {
-            let mut data = [1, 2, 3, 4];
-            scoped(&mut data).await;
-            assert_eq!(data, [2, 3, 5, 6]);
-        })
+        for _ in 1..100 {
+            mt_block_on(async {
+                let mut data = [1, 2, 3, 4];
+                scoped(&mut data).await;
+                assert_eq!(data, [2, 3, 5, 6]);
+            })
+        }
     }
 }
