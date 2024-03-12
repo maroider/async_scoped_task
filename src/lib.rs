@@ -8,14 +8,13 @@ use std::{
 };
 
 use maybe_dangling::ManuallyDrop;
+use pin_project::{pin_project, pinned_drop};
 use slab::Slab;
 
 use lock::{TicketRwLock, TicketRwLockWriteHandle};
 
 // TODO: Panic propogation
 // TODO: Return values
-// TODO: Allow the spawning of subtasks within subtasks from the same scope
-// TODO: Let the callback passed to `scope` return a `Future`
 
 /// An executor capable of paralell execution.
 ///
@@ -34,27 +33,30 @@ pub trait TaskHandle {
     fn abort(&self);
 }
 
+#[derive(Clone)]
 pub struct Scope<'scope, 'env: 'scope> {
-    // *const is so the struct is !Send, since spawning subtasks within a subtask from the Scope
-    // isn't something I want to tackle right now. Using a different inner Scope should be fine.
-    _phantom: PhantomData<*const &'scope &'env ()>,
+    _phantom: PhantomData<&'scope &'env ()>,
     spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }
 
-pub struct ScopeGuard<'scope, Ex>
+#[pin_project(PinnedDrop)]
+pub struct ScopeRunner<'scope, Ex, F, T>
 where
     Ex: Executor,
 {
     _phantom: PhantomData<&'scope ()>,
-    inner: Arc<TicketRwLock<InnerScopeGuard<Ex>>>,
-    inner_write: TicketRwLockWriteHandle,
-    to_spawn: Vec<(usize, ScopedTaskRunner<Ex>)>,
+    #[pin]
+    fut: F,
+    fut_output: Option<T>,
+    shared: Arc<TicketRwLock<RunnerSharedState<Ex>>>,
+    shared_write: TicketRwLockWriteHandle,
+    to_spawn: Vec<(usize, TaskRunner<Ex>)>,
     spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     task_wake_rx: mpsc::Receiver<usize>,
     task_done_rx: mpsc::Receiver<usize>,
 }
 
-struct InnerScopeGuard<Ex>
+struct RunnerSharedState<Ex>
 where
     Ex: Executor,
 {
@@ -70,36 +72,39 @@ where
 struct SubTask<H> {
     // SAFETY: Accessing this field from a runner is UB if the non-'static data this future borrows
     // from is invalidated. Access to this field from a runner is guarded by aqcuiring a read lock
-    // around `InnerScopeGuard`, which only allows reads when `ScopeGuard` is being polled.
-    // `<ScopeGuard as Future>::poll` will block its thread until all readers are done reading.
+    // around `RunnerSharedState`, which only allows reads when `ScopeRunner` is being polled.
+    // `<ScopeRunner as Future>::poll` will block its thread until all readers are done reading.
     future: ManuallyDrop<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
-    // Wakes the associated `ScopedTaskRunner`
+    // Wakes the associated `TaskRunner`
     waker: Option<Waker>,
     has_ticket: bool,
     runner_handle: Option<H>,
 }
 
 /// The future spawned directly onto the runtime.
-struct ScopedTaskRunner<Ex>
+struct TaskRunner<Ex>
 where
     Ex: Executor,
 {
-    scope: Weak<TicketRwLock<InnerScopeGuard<Ex>>>,
+    scope: Weak<TicketRwLock<RunnerSharedState<Ex>>>,
     idx: usize,
     done: bool,
 }
 
-#[must_use = "Must .await the ScopeGuard in order to make progress in subtasks"]
-pub fn scope<'env, 'scope, Ex, F>(f: F) -> ScopeGuard<'scope, Ex>
+/// The `ScopeRunner` won't return until both the future passed to it (`f`) and all subtasks have
+/// finished running.
+#[must_use = "Must .await the ScopeRunner in order to make progress in subtasks"]
+pub fn scope<'env, 'scope, Ex, F, Fut, T>(f: F) -> ScopeRunner<'scope, Ex, Fut, T>
 where
     'env: 'scope,
     Ex: Executor,
-    F: FnOnce(&Scope<'scope, 'env>),
+    F: FnOnce(Scope<'scope, 'env>) -> Fut,
+    Fut: Future<Output = T> + Send + 'scope,
+    T: Send,
 {
     let (tx, rx) = mpsc::channel();
     let scope = Scope::new(tx);
-    f(&scope);
-    ScopeGuard::new(rx)
+    ScopeRunner::new(f(scope), rx)
 }
 
 impl<'scope, 'env> Scope<'scope, 'env> {
@@ -131,16 +136,17 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     }
 }
 
-impl<'scope, Ex> ScopeGuard<'scope, Ex>
+impl<'scope, Ex, F, T> ScopeRunner<'scope, Ex, F, T>
 where
     Ex: Executor,
 {
     fn new(
+        fut: F,
         spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     ) -> Self {
         let (task_done_tx, task_done_rx) = mpsc::channel();
         let (task_wake_tx, task_wake_rx) = mpsc::channel();
-        let (inner, inner_write) = TicketRwLock::new(InnerScopeGuard {
+        let (shared, shared_write) = TicketRwLock::new(RunnerSharedState {
             tasks: Slab::new(),
             scope_waker: None,
             task_wake_tx,
@@ -148,8 +154,10 @@ where
         });
         Self {
             _phantom: PhantomData,
-            inner: Arc::new(inner),
-            inner_write,
+            fut,
+            fut_output: None,
+            shared: Arc::new(shared),
+            shared_write,
             to_spawn: Vec::new(),
             spawn_rx,
             task_wake_rx,
@@ -158,25 +166,24 @@ where
     }
 }
 
-impl<'scope, Ex> Future for ScopeGuard<'scope, Ex>
+impl<'scope, Ex, F, T> Future for ScopeRunner<'scope, Ex, F, T>
 where
     Ex: Executor + 'static,
     <Ex as Executor>::TaskHandle<()>: Unpin + Send,
+    F: Future<Output = T>,
+    T: Send,
 {
-    type Output = ();
+    type Output = T;
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.as_mut().get_mut();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
         // The lock can only be poisoned in the current scope.
-        let inner = this.inner_write.write(&this.inner);
-        inner.scope_waker = Some(cx.waker().clone());
+        let shared = this.shared_write.write(this.shared);
+        shared.scope_waker = Some(cx.waker().clone());
 
         let mut wakers = Vec::new();
         for idx in this.task_wake_rx.try_iter() {
-            let task = inner.tasks.get_mut(idx).unwrap().get_mut().unwrap();
+            let task = shared.tasks.get_mut(idx).unwrap().get_mut().unwrap();
             if let Some(waker) = task.waker.take() {
                 task.has_ticket = true;
                 wakers.push(waker);
@@ -185,7 +192,7 @@ where
 
         let tickets = wakers.len() + this.to_spawn.len();
         // SAFETY: We only made one handle + lock pair, so this is safe
-        let allow_reads = unsafe { this.inner_write.allow_reads(&this.inner, tickets) };
+        let allow_reads = unsafe { this.shared_write.allow_reads(this.shared, tickets) };
         // Dispatch subtasks
         for waker in wakers {
             waker.wake();
@@ -194,22 +201,32 @@ where
         for (idx, runner) in this.to_spawn.drain(..) {
             runner_handles.push((idx, Ex::spawn(runner)));
         }
+
+        // Since we're going to have to block in a second, might as well poll `self.fut` here so
+        // that we at least do _something_ useful.
+        if this.fut_output.is_none() {
+            let poll = this.fut.poll(cx);
+            if let Poll::Ready(output) = poll {
+                *this.fut_output = Some(output);
+            }
+        }
+
         // Block the thread until all subtasks are done polling their futures.
         drop(allow_reads);
-        let inner = this.inner_write.write(&this.inner);
+        let shared = this.shared_write.write(this.shared);
 
         for (idx, handle) in runner_handles {
-            let task = inner.tasks.get_mut(idx).unwrap().get_mut().unwrap();
+            let task = shared.tasks.get_mut(idx).unwrap().get_mut().unwrap();
             task.runner_handle = Some(handle);
         }
 
         for task in this.spawn_rx.try_iter() {
-            let entry = inner.tasks.vacant_entry();
+            let entry = shared.tasks.vacant_entry();
             let idx = entry.key();
             this.to_spawn.push((
                 idx,
-                ScopedTaskRunner {
-                    scope: Arc::downgrade(&this.inner.clone()),
+                TaskRunner {
+                    scope: Arc::downgrade(&this.shared.clone()),
                     idx,
                     done: false,
                 },
@@ -222,26 +239,30 @@ where
             }));
         }
         for idx in this.task_done_rx.try_iter() {
-            inner.tasks.remove(idx);
+            shared.tasks.remove(idx);
         }
         if !this.to_spawn.is_empty() {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        if !inner.tasks.is_empty() {
+        if !shared.tasks.is_empty() {
             return Poll::Pending;
         }
-        Poll::Ready(())
+        Poll::Ready(this.fut_output.take().unwrap())
     }
 }
 
-impl<'scope, Ex> Drop for ScopeGuard<'scope, Ex>
+#[pinned_drop]
+impl<'scope, Ex, F, T> PinnedDrop for ScopeRunner<'scope, Ex, F, T>
 where
     Ex: Executor,
 {
-    fn drop(&mut self) {
-        let inner = self.inner_write.write(&self.inner);
-        for (_, task) in inner.tasks.iter_mut() {
+    // Clippy doesn't understand proc macros, I guess
+    #[allow(clippy::needless_lifetimes)]
+    fn drop(mut self: Pin<&mut Self>) {
+        let this = self.project();
+        let shared = this.shared_write.write(this.shared);
+        for (_, task) in shared.tasks.iter_mut() {
             let task = task.get_mut().unwrap();
             if let Some(runner_handle) = task.runner_handle.as_ref() {
                 runner_handle.abort();
@@ -253,7 +274,7 @@ where
     }
 }
 
-impl<Ex> Future for ScopedTaskRunner<Ex>
+impl<Ex> Future for TaskRunner<Ex>
 where
     Ex: Executor,
 {
@@ -261,14 +282,14 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.done {
-            panic!("Polled ScopedTaskRuner after it completed");
+            panic!("Polled TaskRunner after it completed");
         }
         if let Some(scope) = self.scope.upgrade() {
             if let Some(scope) = scope.try_read() {
                 let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
                 task.waker = Some(cx.waker().clone());
                 // SAFETY: Getting read access through the lock means that it's safe to access the
-                // future, since we may only get a read lock while `<ScopeGuard as Future>::poll`
+                // future, since we may only get a read lock while `<ScopeRunner as Future>::poll`
                 // is executing.
                 let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
                 let poll = future
@@ -425,6 +446,7 @@ mod lock {
             self.inner.read_tickets.fetch_sub(1, Ordering::Release);
         }
     }
+
     impl<'a, T> Deref for TicketRwLockReadGuard<'a, T> {
         type Target = T;
 
@@ -468,8 +490,10 @@ mod tests {
         }
     }
 
-    fn scoped(data: &mut [i32]) -> ScopeGuard<'_, TokioExecutor> {
-        scope::<TokioExecutor, _>(|s| {
+    fn scoped(
+        data: &mut [i32],
+    ) -> ScopeRunner<'_, TokioExecutor, impl Future<Output = ()> + '_, ()> {
+        scope::<TokioExecutor, _, _, _>(move |s| async move {
             let split_at = data.len() / 2;
             let (left, right) = data.split_at_mut(split_at);
             s.spawn(async {
@@ -503,7 +527,7 @@ mod tests {
             {
                 let my_scope = scoped(data);
                 // Once awaited, the scope will spawn all the tasks onto the runtime. On subsequent
-                // polls, the scope will poll any spawned tasks. `ScopeGuard::poll` will only yield
+                // polls, the scope will poll any spawned tasks. `ScopeRunner::poll` will only yield
                 // once its child tasks have all yielded.
                 let mut scope = Box::pin(my_scope);
                 let _ = futures::poll!(&mut scope);
