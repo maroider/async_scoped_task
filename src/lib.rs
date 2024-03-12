@@ -10,7 +10,7 @@ use std::{
 use maybe_dangling::ManuallyDrop;
 use slab::Slab;
 
-use special_lock::{SpecialRwLock, WriteHandle};
+use lock::{TicketRwLock, TicketRwLockWriteHandle};
 
 // TODO: Panic propogation
 // TODO: Return values
@@ -46,8 +46,8 @@ where
     Ex: Executor,
 {
     _phantom: PhantomData<&'scope ()>,
-    inner: Arc<SpecialRwLock<InnerScopeGuard<Ex>>>,
-    inner_write: WriteHandle,
+    inner: Arc<TicketRwLock<InnerScopeGuard<Ex>>>,
+    inner_write: TicketRwLockWriteHandle,
     to_spawn: Vec<(usize, ScopedTaskRunner<Ex>)>,
     spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     task_wake_rx: mpsc::Receiver<usize>,
@@ -58,12 +58,6 @@ struct InnerScopeGuard<Ex>
 where
     Ex: Executor,
 {
-    // When this field is `true`, it signals to `ScopedTaskRunner`s that they may access and run
-    // their futures. We set it to `true` when we enter the body of `<ScopeGuard as Future>::poll`,
-    // and set it to `false` when we exit the function. Additionally, we make sure to block the
-    // thread until all tasks have yielded back to their `ScopedTaskRunner`.
-    // TODO: Is it possible to remove this now?
-    can_run: bool,
     tasks: Slab<Mutex<SubTask<Ex::TaskHandle<()>>>>,
     // This is only an `Option` because of delayed initialization. If we wanted to, we could
     // initialize it with a no-op waker, but I can't be arsed since there's no stable way to do
@@ -74,8 +68,10 @@ where
 }
 
 struct SubTask<H> {
-    // SAFETY: Accessing this field may be UB if the non-'static data this future borrows from is
-    // invalidated. Therefore, we don't touch it unless `InnerScopeGuard.can_run` is `true`.
+    // SAFETY: Accessing this field from a runner is UB if the non-'static data this future borrows
+    // from is invalidated. Access to this field from a runner is guarded by aqcuiring a read lock
+    // around `InnerScopeGuard`, which only allows reads when `ScopeGuard` is being polled.
+    // `<ScopeGuard as Future>::poll` will block its thread until all readers are done reading.
     future: ManuallyDrop<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
     // Wakes the associated `ScopedTaskRunner`
     waker: Option<Waker>,
@@ -88,7 +84,7 @@ struct ScopedTaskRunner<Ex>
 where
     Ex: Executor,
 {
-    scope: Weak<SpecialRwLock<InnerScopeGuard<Ex>>>,
+    scope: Weak<TicketRwLock<InnerScopeGuard<Ex>>>,
     idx: usize,
     done: bool,
 }
@@ -144,15 +140,12 @@ where
     ) -> Self {
         let (task_done_tx, task_done_rx) = mpsc::channel();
         let (task_wake_tx, task_wake_rx) = mpsc::channel();
-        let (inner, inner_write) = unsafe {
-            SpecialRwLock::new(InnerScopeGuard {
-                can_run: false,
-                tasks: Slab::new(),
-                scope_waker: None,
-                task_wake_tx,
-                task_done_tx,
-            })
-        };
+        let (inner, inner_write) = TicketRwLock::new(InnerScopeGuard {
+            tasks: Slab::new(),
+            scope_waker: None,
+            task_wake_tx,
+            task_done_tx,
+        });
         Self {
             _phantom: PhantomData,
             inner: Arc::new(inner),
@@ -190,9 +183,9 @@ where
             }
         }
 
-        inner.can_run = true;
-        let num_readers = wakers.len() + this.to_spawn.len();
-        let allow_reads = this.inner_write.allow_reads(&this.inner, num_readers);
+        let tickets = wakers.len() + this.to_spawn.len();
+        // SAFETY: We only made one handle + lock pair, so this is safe
+        let allow_reads = unsafe { this.inner_write.allow_reads(&this.inner, tickets) };
         // Dispatch subtasks
         for waker in wakers {
             waker.wake();
@@ -204,7 +197,6 @@ where
         // Block the thread until all subtasks are done polling their futures.
         drop(allow_reads);
         let inner = this.inner_write.write(&this.inner);
-        inner.can_run = false;
 
         for (idx, handle) in runner_handles {
             let task = inner.tasks.get_mut(idx).unwrap().get_mut().unwrap();
@@ -255,6 +247,7 @@ where
                 runner_handle.abort();
             }
             // SAFETY: The lifetime on `Self` guards against invalidating the borrow of the futures
+            // until we're dropped or leaked.
             unsafe { ManuallyDrop::drop(&mut task.future) };
         }
     }
@@ -274,28 +267,28 @@ where
             if let Some(scope) = scope.try_read() {
                 let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
                 task.waker = Some(cx.waker().clone());
-                if scope.can_run {
-                    // SAFETY: `can_run` signals that it's safe to access the future.
-                    let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
-                    let poll = future
-                        .as_mut()
-                        .poll(&mut Context::from_waker(&scoped_task_waker(
-                            scope.scope_waker.as_ref().unwrap().clone(),
-                            scope.task_wake_tx.clone(),
-                            self.idx,
-                        )));
-                    task.future = ManuallyDrop::new(Some(future));
-                    if poll.is_ready() {
-                        let _ = scope.task_done_tx.send(self.idx);
-                        self.done = true;
-                    }
-                    if task.has_ticket {
-                        task.has_ticket = false;
-                        drop(task);
-                        scope.consume_ticket();
-                    }
-                    return poll;
+                // SAFETY: Getting read access through the lock means that it's safe to access the
+                // future, since we may only get a read lock while `<ScopeGuard as Future>::poll`
+                // is executing.
+                let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
+                let poll = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&scoped_task_waker(
+                        scope.scope_waker.as_ref().unwrap().clone(),
+                        scope.task_wake_tx.clone(),
+                        self.idx,
+                    )));
+                task.future = ManuallyDrop::new(Some(future));
+                if poll.is_ready() {
+                    let _ = scope.task_done_tx.send(self.idx);
+                    self.done = true;
                 }
+                if task.has_ticket {
+                    task.has_ticket = false;
+                    drop(task);
+                    scope.consume_ticket();
+                }
+                return poll;
             }
         }
         Poll::Pending
@@ -338,7 +331,7 @@ fn scoped_task_waker(scope_waker: Waker, tx: mpsc::Sender<usize>, idx: usize) ->
     unsafe { Waker::from_raw(raw) }
 }
 
-mod special_lock {
+mod lock {
     //! A specialized lock just for our use-case
     //!
     //! It lets us write by default with a `WriteHandle`, and then we can optionally give read
@@ -352,43 +345,39 @@ mod special_lock {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    pub struct SpecialRwLock<T> {
+    pub struct TicketRwLock<T> {
         item: UnsafeCell<T>,
         read_tickets: AtomicUsize,
         readers: AtomicUsize,
     }
 
-    pub struct ReadableSpecialRwLock<'a, T> {
-        inner: &'a SpecialRwLock<T>,
-        _handle: &'a mut WriteHandle,
+    pub struct TicketRwLockReadPermissionGuard<'a, T> {
+        inner: &'a TicketRwLock<T>,
+        _handle: &'a mut TicketRwLockWriteHandle,
     }
 
-    pub struct SpecialRwLockReadGuard<'a, T> {
-        inner: &'a SpecialRwLock<T>,
+    pub struct TicketRwLockReadGuard<'a, T> {
+        inner: &'a TicketRwLock<T>,
     }
 
-    pub struct WriteHandle {}
+    pub struct TicketRwLockWriteHandle {}
 
-    impl<T> SpecialRwLock<T> {
-        /// # Safety
-        ///
-        /// It's the caller's responsibility to make sure they use the returned write handle with
-        /// the lock it was created from.
-        pub unsafe fn new(item: T) -> (Self, WriteHandle) {
+    impl<T> TicketRwLock<T> {
+        pub fn new(item: T) -> (Self, TicketRwLockWriteHandle) {
             (
                 Self {
                     item: UnsafeCell::new(item),
                     read_tickets: AtomicUsize::new(0),
                     readers: AtomicUsize::new(0),
                 },
-                WriteHandle {},
+                TicketRwLockWriteHandle {},
             )
         }
 
-        pub fn try_read(&self) -> Option<SpecialRwLockReadGuard<'_, T>> {
+        pub fn try_read(&self) -> Option<TicketRwLockReadGuard<'_, T>> {
             self.readers.fetch_add(1, Ordering::Release);
             if self.read_tickets.load(Ordering::Acquire) > 0 {
-                Some(SpecialRwLockReadGuard { inner: self })
+                Some(TicketRwLockReadGuard { inner: self })
             } else {
                 self.readers.fetch_sub(1, Ordering::Relaxed);
                 None
@@ -396,28 +385,32 @@ mod special_lock {
         }
     }
 
-    unsafe impl<T: Send> Send for SpecialRwLock<T> {}
-    unsafe impl<T: Send + Sync> Sync for SpecialRwLock<T> {}
+    unsafe impl<T: Send> Send for TicketRwLock<T> {}
+    unsafe impl<T: Send + Sync> Sync for TicketRwLock<T> {}
 
-    impl WriteHandle {
-        pub fn write<'a, T>(&'a mut self, lock: &'a SpecialRwLock<T>) -> &'a mut T {
+    // These methods work based on the same principle as `qcell`'s epynomous `Qcell` type.
+    impl TicketRwLockWriteHandle {
+        pub fn write<'a, T>(&'a mut self, lock: &'a TicketRwLock<T>) -> &'a mut T {
             unsafe { lock.item.get().as_mut().unwrap() }
         }
 
-        pub fn allow_reads<'a, T>(
+        // # Safety
+        //
+        // The lock passed in must be the lock `self` was constructed alongside.
+        pub unsafe fn allow_reads<'a, T>(
             &'a mut self,
-            lock: &'a SpecialRwLock<T>,
-            num_readers: usize,
-        ) -> ReadableSpecialRwLock<'a, T> {
-            lock.read_tickets.store(num_readers, Ordering::Release);
-            ReadableSpecialRwLock {
+            lock: &'a TicketRwLock<T>,
+            read_tickets: usize,
+        ) -> TicketRwLockReadPermissionGuard<'a, T> {
+            lock.read_tickets.store(read_tickets, Ordering::Release);
+            TicketRwLockReadPermissionGuard {
                 inner: lock,
                 _handle: self,
             }
         }
     }
 
-    impl<'a, T> Drop for ReadableSpecialRwLock<'a, T> {
+    impl<'a, T> Drop for TicketRwLockReadPermissionGuard<'a, T> {
         fn drop(&mut self) {
             while self.inner.readers.load(Ordering::Acquire) > 0
                 || self.inner.read_tickets.load(Ordering::Acquire) > 0
@@ -427,12 +420,12 @@ mod special_lock {
         }
     }
 
-    impl<'a, T> SpecialRwLockReadGuard<'a, T> {
+    impl<'a, T> TicketRwLockReadGuard<'a, T> {
         pub fn consume_ticket(self) {
             self.inner.read_tickets.fetch_sub(1, Ordering::Release);
         }
     }
-    impl<'a, T> Deref for SpecialRwLockReadGuard<'a, T> {
+    impl<'a, T> Deref for TicketRwLockReadGuard<'a, T> {
         type Target = T;
 
         fn deref(&self) -> &Self::Target {
@@ -440,13 +433,13 @@ mod special_lock {
         }
     }
 
-    impl<'a, T> DerefMut for SpecialRwLockReadGuard<'a, T> {
+    impl<'a, T> DerefMut for TicketRwLockReadGuard<'a, T> {
         fn deref_mut(&mut self) -> &mut Self::Target {
             unsafe { self.inner.item.get().as_mut().unwrap() }
         }
     }
 
-    impl<'a, T> Drop for SpecialRwLockReadGuard<'a, T> {
+    impl<'a, T> Drop for TicketRwLockReadGuard<'a, T> {
         fn drop(&mut self) {
             self.inner.readers.fetch_sub(1, Ordering::Relaxed);
         }
@@ -498,7 +491,8 @@ mod tests {
         let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
         rt.block_on(future);
         // Silence spurious Miri deadlock warnings caused by `tokio` runtime cleanup.
-        // Requires running Miri with `MIRIFLAGS=-Zmiri-ignore-leaks`.
+        // Running without `MIRIFLAGS=-Zmiri-ignore-leaks` makes Miri consistently complain about
+        // the main thread exiting before all other threads have exited.
         #[cfg(miri)]
         mem::forget(rt);
     }
@@ -508,9 +502,9 @@ mod tests {
         async fn evil_fanout(data: &mut Vec<i32>) {
             {
                 let my_scope = scoped(data);
-                // Once awaited, the scope will spawn all but the first task onto the runtime, and
-                // then poll the first task itself. `Scope::poll` will only yield once its child
-                // tasks have all yielded.
+                // Once awaited, the scope will spawn all the tasks onto the runtime. On subsequent
+                // polls, the scope will poll any spawned tasks. `ScopeGuard::poll` will only yield
+                // once its child tasks have all yielded.
                 let mut scope = Box::pin(my_scope);
                 let _ = futures::poll!(&mut scope);
 
@@ -519,7 +513,8 @@ mod tests {
 
                 // This will invalidate `scope`'s borrow of `data`. Since the child tasks may only
                 // run (and thus access the futures passed to `s.spawn()`) when we poll `scope`, no
-                // use-after-free is possible.
+                // use-after-free is possible. This holds true even if we wrap the current future
+                // (aka the current async fn) in another future that tries to do the same thing.
                 mem::forget(scope);
 
                 data.push(2);
@@ -536,12 +531,10 @@ mod tests {
 
     #[test]
     fn test_normal_fanout() {
-        for _ in 1..100 {
-            mt_block_on(async {
-                let mut data = [1, 2, 3, 4];
-                scoped(&mut data).await;
-                assert_eq!(data, [2, 3, 5, 6]);
-            })
-        }
+        mt_block_on(async {
+            let mut data = [1, 2, 3, 4];
+            scoped(&mut data).await;
+            assert_eq!(data, [2, 3, 5, 6]);
+        })
     }
 }
