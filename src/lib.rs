@@ -3,7 +3,10 @@ use std::{
     marker::PhantomData,
     mem,
     pin::Pin,
-    sync::{mpsc, Arc, Mutex, Weak},
+    sync::{
+        mpsc::{self, TryRecvError},
+        Arc, Mutex, Weak,
+    },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
@@ -14,7 +17,6 @@ use slab::Slab;
 use lock::{TicketRwLock, TicketRwLockWriteHandle};
 
 // TODO: Panic propogation
-// TODO: Return values
 
 /// An executor capable of paralell execution.
 ///
@@ -33,7 +35,6 @@ pub trait TaskHandle {
     fn abort(&self);
 }
 
-#[derive(Clone)]
 pub struct Scope<'scope, 'env: 'scope> {
     _phantom: PhantomData<&'scope &'env ()>,
     spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
@@ -54,6 +55,12 @@ where
     spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     task_wake_rx: mpsc::Receiver<usize>,
     task_done_rx: mpsc::Receiver<usize>,
+}
+
+pub struct TaskJoinHandle<'scope, T> {
+    _phantom: PhantomData<&'scope T>,
+    waker: Weak<Mutex<Option<Waker>>>,
+    ret_rx: mpsc::Receiver<T>,
 }
 
 struct RunnerSharedState<Ex>
@@ -117,13 +124,24 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         }
     }
 
-    pub fn spawn<F, T>(&self, fut: F)
+    // SAFETY: We consume and return `self` so that `fut` cannot use `self`,
+    // which would lead to data races and use-after-free issues.
+    pub fn spawn<'a, F, T>(self, fut: F) -> (Self, TaskJoinHandle<'scope, T>)
     where
         F: Future<Output = T> + Send + 'scope,
         T: Send + 'scope,
     {
-        let fut = Box::new(async {
-            fut.await;
+        let (tx, ret_rx) = mpsc::channel();
+        // TODO: Find something better than this
+        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        let w = waker.clone();
+        let fut = Box::new(async move {
+            let ret = fut.await;
+            if let Some(w) = w.lock().unwrap().take() {
+                w.wake();
+            }
+            drop(w);
+            let _ = tx.send(ret);
         });
         // SAFETY: The rest of this module makes sure to only deref the `Box` when we're certain
         // that the 'scope borrow is still live/valid.
@@ -133,6 +151,15 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             ))
         };
         let _ = self.spawn_tx.send(fut);
+
+        (
+            self,
+            TaskJoinHandle {
+                _phantom: PhantomData,
+                ret_rx,
+                waker: Arc::downgrade(&waker),
+            },
+        )
     }
 }
 
@@ -243,12 +270,12 @@ where
         }
         if !this.to_spawn.is_empty() {
             cx.waker().wake_by_ref();
-            return Poll::Pending;
         }
-        if !shared.tasks.is_empty() {
-            return Poll::Pending;
+        if let Some(output) = this.fut_output.take() {
+            Poll::Ready(output)
+        } else {
+            Poll::Pending
         }
-        Poll::Ready(this.fut_output.take().unwrap())
     }
 }
 
@@ -274,6 +301,25 @@ where
     }
 }
 
+impl<'scope, T> Future for TaskJoinHandle<'scope, T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.ret_rx.try_recv() {
+            Ok(ret) => Poll::Ready(ret),
+            Err(TryRecvError::Empty) => {
+                if let Some(waker) = self.waker.upgrade() {
+                    *waker.lock().unwrap() = Some(cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    Poll::Ready(self.ret_rx.recv().unwrap())
+                }
+            }
+            Err(TryRecvError::Disconnected) => todo!("Not sure what's appropriate here"),
+        }
+    }
+}
+
 impl<Ex> Future for TaskRunner<Ex>
 where
     Ex: Executor,
@@ -287,6 +333,8 @@ where
         if let Some(scope) = self.scope.upgrade() {
             if let Some(scope) = scope.try_read() {
                 let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
+                // FIXME: We need to always update the waker, or else we may miss the "latest" waker
+                // if the poll happens while we don't allow reader access
                 task.waker = Some(cx.waker().clone());
                 // SAFETY: Getting read access through the lock means that it's safe to access the
                 // future, since we may only get a read lock while `<ScopeRunner as Future>::poll`
@@ -472,6 +520,8 @@ mod lock {
 mod tests {
     use super::*;
 
+    use tokio::join;
+
     struct TokioExecutor {}
     impl Executor for TokioExecutor {
         type TaskHandle<T> = tokio::task::JoinHandle<T>;
@@ -492,33 +542,42 @@ mod tests {
 
     fn scoped(
         data: &mut [i32],
-    ) -> ScopeRunner<'_, TokioExecutor, impl Future<Output = ()> + '_, ()> {
-        scope::<TokioExecutor, _, _, _>(move |s| async move {
+    ) -> ScopeRunner<
+        '_,
+        TokioExecutor,
+        impl Future<Output = (&'static str, &'static str)> + '_,
+        (&'static str, &'static str),
+    > {
+        scope::<TokioExecutor, _, _, _>(|s| async {
             let split_at = data.len() / 2;
             let (left, right) = data.split_at_mut(split_at);
-            s.spawn(async {
+            let (s, task1) = s.spawn(async {
                 tokio::task::yield_now().await;
                 for n in left.iter_mut() {
                     *n += 1;
                 }
+                "Hello"
             });
-            s.spawn(async {
+            let (_s, task2) = s.spawn(async {
                 tokio::task::yield_now().await;
                 for n in right.iter_mut() {
                     *n += 2;
                 }
+                "World"
             });
+            join!(task1, task2)
         })
     }
 
-    fn mt_block_on(future: impl Future<Output = ()>) {
+    fn mt_block_on<T>(future: impl Future<Output = T>) -> T {
         let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
-        rt.block_on(future);
+        let output = rt.block_on(future);
         // Silence spurious Miri deadlock warnings caused by `tokio` runtime cleanup.
         // Running without `MIRIFLAGS=-Zmiri-ignore-leaks` makes Miri consistently complain about
         // the main thread exiting before all other threads have exited.
         #[cfg(miri)]
         mem::forget(rt);
+        output
     }
 
     #[test]
@@ -555,10 +614,9 @@ mod tests {
 
     #[test]
     fn test_normal_fanout() {
-        mt_block_on(async {
-            let mut data = [1, 2, 3, 4];
-            scoped(&mut data).await;
-            assert_eq!(data, [2, 3, 5, 6]);
-        })
+        let mut data = [1, 2, 3, 4];
+        let output = mt_block_on(async { scoped(&mut data).await });
+        assert_eq!(data, [2, 3, 5, 6]);
+        assert_eq!(output, ("Hello", "World"));
     }
 }
