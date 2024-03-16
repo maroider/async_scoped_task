@@ -35,13 +35,13 @@ pub trait TaskHandle {
     fn abort(&self);
 }
 
-pub struct Scope<'scope, 'env: 'scope> {
+pub struct ScopedTaskSpawner<'scope, 'env: 'scope> {
     _phantom: PhantomData<&'scope &'env ()>,
     spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }
 
 #[pin_project(PinnedDrop)]
-pub struct ScopeRunner<'scope, Ex, F, T>
+pub struct Scope<'scope, Ex, F, T>
 where
     Ex: Executor,
 {
@@ -49,7 +49,7 @@ where
     #[pin]
     fut: F,
     fut_output: Option<T>,
-    shared: Arc<TicketRwLock<RunnerSharedState<Ex>>>,
+    shared: Arc<TicketRwLock<SharedState<Ex>>>,
     shared_write: TicketRwLockWriteHandle,
     to_spawn: Vec<(usize, TaskRunner<Ex>)>,
     spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
@@ -64,11 +64,11 @@ pub struct TaskJoinHandle<'scope, T> {
     ret_rx: mpsc::Receiver<T>,
 }
 
-struct RunnerSharedState<Ex>
+struct SharedState<Ex>
 where
     Ex: Executor,
 {
-    tasks: Slab<Mutex<SubTask<Ex::TaskHandle<()>>>>,
+    tasks: Slab<Mutex<TaskState<Ex::TaskHandle<()>>>>,
     // This is only an `Option` because of delayed initialization. If we wanted to, we could
     // initialize it with a no-op waker, but I can't be arsed since there's no stable way to do
     // it in the standard library.
@@ -78,11 +78,11 @@ where
     task_panic_tx: mpsc::Sender<Box<dyn Any + Send + 'static>>,
 }
 
-struct SubTask<H> {
+struct TaskState<H> {
     // SAFETY: Accessing this field from a runner is UB if the non-'static data this future borrows
-    // from is invalidated. Access to this field from a runner is guarded by aqcuiring a read lock
-    // around `RunnerSharedState`, which only allows reads when `ScopeRunner` is being polled.
-    // `<ScopeRunner as Future>::poll` will block its thread until all readers are done reading.
+    // from is invalidated. Access to this field from a runner is guarded by aqcuiring a read
+    // lock around `SharedState`, which only allows reads when `Scope` is being polled. `<Scope as
+    // Future>::poll` will block its thread until all readers are done reading.
     future: ManuallyDrop<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
     // Wakes the associated `TaskRunner`
     waker: Option<Waker>,
@@ -95,31 +95,29 @@ struct TaskRunner<Ex>
 where
     Ex: Executor,
 {
-    scope: Weak<TicketRwLock<RunnerSharedState<Ex>>>,
+    scope: Weak<TicketRwLock<SharedState<Ex>>>,
     idx: usize,
     done: bool,
 }
 
-/// The `ScopeRunner` won't return until both the future passed to it (`f`) and all subtasks have
-/// finished running.
-#[must_use = "Must .await the ScopeRunner in order to make progress in subtasks"]
-pub fn scope<'env, 'scope, Ex, F, Fut, T>(f: F) -> ScopeRunner<'scope, Ex, Fut, T>
+#[must_use = "Must .await the Scope in order to make progress in subtasks"]
+pub fn scope<'env, 'scope, Ex, F, Fut, T>(f: F) -> Scope<'scope, Ex, Fut, T>
 where
     'env: 'scope,
     Ex: Executor,
-    F: FnOnce(Scope<'scope, 'env>) -> Fut,
+    F: FnOnce(ScopedTaskSpawner<'scope, 'env>) -> Fut,
     Fut: Future<Output = T> + Send + 'scope,
     T: Send,
 {
     let (tx, rx) = mpsc::channel();
-    let scope = Scope::new(tx);
-    ScopeRunner::new(f(scope), rx)
+    let scope = ScopedTaskSpawner::new(tx);
+    Scope::new(f(scope), rx)
 }
 
-impl<'scope, 'env> Scope<'scope, 'env> {
+impl<'scope, 'env> ScopedTaskSpawner<'scope, 'env> {
     fn new(
         spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
-    ) -> Scope<'scope, 'env> {
+    ) -> ScopedTaskSpawner<'scope, 'env> {
         Self {
             _phantom: PhantomData,
             spawn_tx,
@@ -165,7 +163,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     }
 }
 
-impl<'scope, Ex, F, T> ScopeRunner<'scope, Ex, F, T>
+impl<'scope, Ex, F, T> Scope<'scope, Ex, F, T>
 where
     Ex: Executor,
 {
@@ -176,7 +174,7 @@ where
         let (task_done_tx, task_done_rx) = mpsc::channel();
         let (task_wake_tx, task_wake_rx) = mpsc::channel();
         let (task_panic_tx, task_panic_rx) = mpsc::channel();
-        let (shared, shared_write) = TicketRwLock::new(RunnerSharedState {
+        let (shared, shared_write) = TicketRwLock::new(SharedState {
             tasks: Slab::new(),
             scope_waker: None,
             task_wake_tx,
@@ -198,7 +196,7 @@ where
     }
 }
 
-impl<'scope, Ex, F, T> Future for ScopeRunner<'scope, Ex, F, T>
+impl<'scope, Ex, F, T> Future for Scope<'scope, Ex, F, T>
 where
     Ex: Executor + 'static,
     <Ex as Executor>::TaskHandle<()>: Unpin + Send,
@@ -267,7 +265,7 @@ where
                     done: false,
                 },
             ));
-            entry.insert(Mutex::new(SubTask {
+            entry.insert(Mutex::new(TaskState {
                 future: ManuallyDrop::new(Some(Box::into_pin(ManuallyDrop::into_inner(task)))),
                 waker: None,
                 has_ticket: true,
@@ -289,7 +287,7 @@ where
 }
 
 #[pinned_drop]
-impl<'scope, Ex, F, T> PinnedDrop for ScopeRunner<'scope, Ex, F, T>
+impl<'scope, Ex, F, T> PinnedDrop for Scope<'scope, Ex, F, T>
 where
     Ex: Executor,
 {
@@ -343,8 +341,8 @@ where
             if let Some(scope) = scope.try_read() {
                 let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
                 task.waker = Some(cx.waker().clone());
-                // SAFETY: Getting read access through the lock means that it's safe to access the
-                // future, since we may only get a read lock while `<ScopeRunner as Future>::poll`
+                // SAFETY: Getting read access through the lock means that it's safe to access
+                // the future, since we may only get a read lock while `<Scope as Future>::poll`
                 // is executing.
                 let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
                 let panic_result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -380,13 +378,13 @@ where
                 }
                 return poll;
             } else {
-                // This avoids a potential deadlock in `ScopeRunner`, where it blocks forever
-                // waiting for the ticket count to go down to 0, since a task didn't wake even
-                // though it had a ticket. While this approach isn't great, I'm not sure how big
-                // of a problem this will be in practice. I wasn't able to trigger this branch
-                // with tokio, but maybe it could happen with a real workload? Either way, if we
-                // implement some kind of work stealing on our end in `ScopeRunner`, we can remove
-                // this without causing any potential deadlocks.
+                // This avoids a potential deadlock in `Scope`, where it blocks forever waiting for
+                // the ticket count to go down to 0, since a task didn't wake even though it had a
+                // ticket. While this approach isn't great, I'm not sure how big of a problem this
+                // will be in practice. I wasn't able to trigger this branch with tokio, but maybe
+                // it could happen with a real workload? Either way, if we implement some kind
+                // of work stealing on our end in `Scope`, we can remove this without causing any
+                // potential deadlocks.
                 cx.waker().wake_by_ref();
             }
         }
@@ -573,8 +571,8 @@ mod tests {
 
     fn scoped<'env, 'scope, F, T>(
         data: &'env mut [i32],
-        f: impl FnOnce(Scope<'scope, 'env>, &'env mut [i32]) -> F,
-    ) -> ScopeRunner<'_, TokioExecutor, impl Future<Output = T> + 'env, T>
+        f: impl FnOnce(ScopedTaskSpawner<'scope, 'env>, &'env mut [i32]) -> F,
+    ) -> Scope<'_, TokioExecutor, impl Future<Output = T> + 'env, T>
     where
         'env: 'scope,
         F: Future<Output = T> + Send + 'env,
@@ -584,7 +582,7 @@ mod tests {
     }
 
     fn hello_world<'env, 'scope>(
-        s: Scope<'env, 'scope>,
+        s: ScopedTaskSpawner<'env, 'scope>,
         data: &'env mut [i32],
     ) -> impl Future<Output = (&'static str, &'static str)> + Send + 'scope
     where
@@ -628,8 +626,8 @@ mod tests {
             {
                 let my_scope = scoped(data, hello_world);
                 // Once awaited, the scope will spawn all the tasks onto the runtime. On subsequent
-                // polls, the scope will poll any spawned tasks. `ScopeRunner::poll` will only yield
-                // once its child tasks have all yielded.
+                // polls, the scope will poll any spawned tasks. `Scope::poll` will only yield once
+                // its child tasks have all yielded.
                 let mut scope = Box::pin(my_scope);
                 let _ = poll!(&mut scope);
 
