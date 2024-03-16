@@ -333,8 +333,6 @@ where
         if let Some(scope) = self.scope.upgrade() {
             if let Some(scope) = scope.try_read() {
                 let mut task = scope.tasks.get(self.idx).unwrap().lock().unwrap();
-                // FIXME: We need to always update the waker, or else we may miss the "latest" waker
-                // if the poll happens while we don't allow reader access
                 task.waker = Some(cx.waker().clone());
                 // SAFETY: Getting read access through the lock means that it's safe to access the
                 // future, since we may only get a read lock while `<ScopeRunner as Future>::poll`
@@ -358,6 +356,15 @@ where
                     scope.consume_ticket();
                 }
                 return poll;
+            } else {
+                // This avoids a potential deadlock in `ScopeRunner`, where it blocks forever
+                // waiting for the ticket count to go down to 0, since a task didn't wake even
+                // though it had a ticket. While this approach isn't great, I'm not sure how big
+                // of a problem this will be in practice. I wasn't able to trigger this branch
+                // with tokio, but maybe it could happen with a real workload? Either way, if we
+                // implement some kind of work stealing on our end in `ScopeRunner`, we can remove
+                // this without causing any potential deadlocks.
+                cx.waker().wake_by_ref();
             }
         }
         Poll::Pending
