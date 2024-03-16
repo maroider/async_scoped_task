@@ -617,6 +617,7 @@ mod tests {
         // the main thread exiting before all other threads have exited.
         #[cfg(miri)]
         mem::forget(rt);
+        #[allow(clippy::let_and_return)]
         output
     }
 
@@ -664,7 +665,7 @@ mod tests {
     #[should_panic]
     fn test_panic_propogation() {
         let mut data = [];
-        let _ = mt_block_on(async {
+        mt_block_on(async {
             let fut = scoped(&mut data, |s, _data| async {
                 s.spawn(async {
                     panic!("Disaster!");
