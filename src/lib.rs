@@ -1,7 +1,9 @@
 use std::{
+    any::Any,
     future::Future,
     marker::PhantomData,
     mem,
+    panic::{self, AssertUnwindSafe},
     pin::Pin,
     sync::{
         mpsc::{self, TryRecvError},
@@ -15,8 +17,6 @@ use pin_project::{pin_project, pinned_drop};
 use slab::Slab;
 
 use lock::{TicketRwLock, TicketRwLockWriteHandle};
-
-// TODO: Panic propogation
 
 /// An executor capable of paralell execution.
 ///
@@ -55,6 +55,7 @@ where
     spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     task_wake_rx: mpsc::Receiver<usize>,
     task_done_rx: mpsc::Receiver<usize>,
+    task_panic_rx: mpsc::Receiver<Box<dyn Any + Send + 'static>>,
 }
 
 pub struct TaskJoinHandle<'scope, T> {
@@ -74,6 +75,7 @@ where
     scope_waker: Option<Waker>,
     task_wake_tx: mpsc::Sender<usize>,
     task_done_tx: mpsc::Sender<usize>,
+    task_panic_tx: mpsc::Sender<Box<dyn Any + Send + 'static>>,
 }
 
 struct SubTask<H> {
@@ -173,11 +175,13 @@ where
     ) -> Self {
         let (task_done_tx, task_done_rx) = mpsc::channel();
         let (task_wake_tx, task_wake_rx) = mpsc::channel();
+        let (task_panic_tx, task_panic_rx) = mpsc::channel();
         let (shared, shared_write) = TicketRwLock::new(RunnerSharedState {
             tasks: Slab::new(),
             scope_waker: None,
             task_wake_tx,
             task_done_tx,
+            task_panic_tx,
         });
         Self {
             _phantom: PhantomData,
@@ -189,6 +193,7 @@ where
             spawn_rx,
             task_wake_rx,
             task_done_rx,
+            task_panic_rx,
         }
     }
 }
@@ -245,6 +250,10 @@ where
         for (idx, handle) in runner_handles {
             let task = shared.tasks.get_mut(idx).unwrap().get_mut().unwrap();
             task.runner_handle = Some(handle);
+        }
+
+        if let Ok(panic) = this.task_panic_rx.try_recv() {
+            panic::resume_unwind(panic);
         }
 
         for task in this.spawn_rx.try_iter() {
@@ -338,13 +347,27 @@ where
                 // future, since we may only get a read lock while `<ScopeRunner as Future>::poll`
                 // is executing.
                 let mut future = ManuallyDrop::into_inner(mem::take(&mut task.future)).unwrap();
-                let poll = future
-                    .as_mut()
-                    .poll(&mut Context::from_waker(&scoped_task_waker(
-                        scope.scope_waker.as_ref().unwrap().clone(),
-                        scope.task_wake_tx.clone(),
-                        self.idx,
-                    )));
+                let panic_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&scoped_task_waker(
+                            scope.scope_waker.as_ref().unwrap().clone(),
+                            scope.task_wake_tx.clone(),
+                            self.idx,
+                        )))
+                }));
+                let poll = match panic_result {
+                    Err(panic) => {
+                        scope.task_panic_tx.send(panic).unwrap();
+                        if task.has_ticket {
+                            drop(task);
+                            scope.consume_ticket();
+                        }
+                        // All allocations should get cleaned automatically up after this.
+                        panic!("Task future panicked");
+                    }
+                    Ok(poll) => poll,
+                };
                 task.future = ManuallyDrop::new(Some(future));
                 if poll.is_ready() {
                     let _ = scope.task_done_tx.send(self.idx);
@@ -527,7 +550,8 @@ mod lock {
 mod tests {
     use super::*;
 
-    use tokio::join;
+    use futures::poll;
+    use tokio::{join, pin};
 
     struct TokioExecutor {}
     impl Executor for TokioExecutor {
@@ -547,15 +571,26 @@ mod tests {
         }
     }
 
-    fn scoped(
-        data: &mut [i32],
-    ) -> ScopeRunner<
-        '_,
-        TokioExecutor,
-        impl Future<Output = (&'static str, &'static str)> + '_,
-        (&'static str, &'static str),
-    > {
-        scope::<TokioExecutor, _, _, _>(|s| async {
+    fn scoped<'env, 'scope, F, T>(
+        data: &'env mut [i32],
+        f: impl FnOnce(Scope<'scope, 'env>, &'env mut [i32]) -> F,
+    ) -> ScopeRunner<'_, TokioExecutor, impl Future<Output = T> + 'env, T>
+    where
+        'env: 'scope,
+        F: Future<Output = T> + Send + 'env,
+        T: Send,
+    {
+        scope::<TokioExecutor, _, _, _>(|s| f(s, data))
+    }
+
+    fn hello_world<'env, 'scope>(
+        s: Scope<'env, 'scope>,
+        data: &'env mut [i32],
+    ) -> impl Future<Output = (&'static str, &'static str)> + Send + 'scope
+    where
+        'env: 'scope,
+    {
+        async {
             let split_at = data.len() / 2;
             let (left, right) = data.split_at_mut(split_at);
             let (s, task1) = s.spawn(async {
@@ -573,7 +608,7 @@ mod tests {
                 "World"
             });
             join!(task1, task2)
-        })
+        }
     }
 
     fn mt_block_on<T>(future: impl Future<Output = T>) -> T {
@@ -591,12 +626,12 @@ mod tests {
     fn test_evil_fanout() {
         async fn evil_fanout(data: &mut Vec<i32>) {
             {
-                let my_scope = scoped(data);
+                let my_scope = scoped(data, hello_world);
                 // Once awaited, the scope will spawn all the tasks onto the runtime. On subsequent
                 // polls, the scope will poll any spawned tasks. `ScopeRunner::poll` will only yield
                 // once its child tasks have all yielded.
                 let mut scope = Box::pin(my_scope);
-                let _ = futures::poll!(&mut scope);
+                let _ = poll!(&mut scope);
 
                 // E499: Cannot borrow `*data` as mutable more than once at a time
                 // data.push(0);
@@ -622,8 +657,28 @@ mod tests {
     #[test]
     fn test_normal_fanout() {
         let mut data = [1, 2, 3, 4];
-        let output = mt_block_on(async { scoped(&mut data).await });
+        let output = mt_block_on(async { scoped(&mut data, hello_world).await });
         assert_eq!(data, [2, 3, 5, 6]);
         assert_eq!(output, ("Hello", "World"));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_panic_propogation() {
+        let mut data = [];
+        let _ = mt_block_on(async {
+            let fut = scoped(&mut data, |s, _data| async {
+                s.spawn(async {
+                    panic!("Disaster!");
+                })
+                .1
+                .await;
+                eprintln!("The panic in the subtask should prevent us from getting this far");
+            });
+            pin!(fut);
+            for _ in 0..5 {
+                let _ = poll!(fut.as_mut());
+            }
+        });
     }
 }
