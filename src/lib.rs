@@ -1,3 +1,124 @@
+//! A library demonstrating scoped async tasks that *don't* block the thread when there's nothing
+//! to do. In other words, it's a slightly more flexible variation on the approach taken by
+//! [`async_scoped`].
+//!
+//! # Overview
+//!
+//! The following two blog posts lay out the desireable traits of a scoped task API, and explain
+//! why we can't have all these desireable traits at once:
+//! - [withoutboats: The Scoped Task trilemma](https://without.boats/blog/the-scoped-task-trilemma/)
+//!   - Concurrency
+//!   - Parallelizability
+//!   - Borrowing
+//! - [tmandry: A formulation for scoped tasks in Rust](https://tmandry.gitlab.io/blog/posts/2023-03-01-scoped-tasks#formulation)
+//!   - Structure
+//!   - Borrowing
+//!   - Nesting
+//!   - Parallelism
+//!   - Safety
+//!
+//! The goal of this libary is to approximate something that ticks all these boxes to some extent,
+//! at *some* runtime cost. Unfortunately, it's not possible for the parent and child tasks to be
+//! *truly* concurrent in this design without language-level changes.
+//!
+//! In tmandry's post, he gives the following instructive example of why a naïve translation of the
+//! scoped threads API to async can't work:
+//!
+//! ```rust,ignore
+//! async fn evil_fanout(data: &Vec<Foo>) {
+//!     let scope_fut = task::scope(|s| async {
+//!         for chunk in data.chunks(50) {
+//!             // Tasks are immediately spawned onto the async runtime, and run unconstrained
+//!             s.spawn(|| async { process(chunk).await });
+//!         }
+//!     });
+//!
+//!     // Let's get some tasks going on other threads...
+//!     let mut scope_fut = Box::pin(scope_fut);
+//!     futures::poll!(&mut scope_fut);
+//!     futures::poll!(&mut scope_fut);
+//!
+//!     // ...now pull out the rug! 😱
+//!     std::mem::forget(scope_fut);
+//!     return;
+//! }
+//! ```
+//!
+//! The problem is that since the scoped tasks are allowed to run in parallel to the parent task,
+//! they have no way of knowing that their borrow of `data` has been invalidated. The scoped
+//! threads API doesn't have this problem, since normal functions can "notice" that they're being
+//! returned from (or being unwound). However, there is one place in the async machinery we *can*
+//! abuse the same fact: `Future::poll`.
+//!
+//! On its own, this observation doesn't change much of anything, but if we introduce a layer of
+//! indirection, we can let the [`Scope`] future own all child tasks, and then spawn thin "runner"
+//! futures onto the underlying runtime. When we're in the body of `<Scope as Future>::poll`, we
+//! know that whatever borrows the child tasks made are still valid, since by virtue of being
+//! polled, we know the `Scope` hasn't been dropped or leaked. This then lets us wake the thin
+//! "runner" futures so they can poll their tasks' futures in turn. We block inside `<Scope as
+//! Future>::poll` until all child task futures have yielded.
+//!
+//! The fact that we block until child tasks have yielded is not ideal, since it means the thread
+//! *could* have been doing other useful work. Nevertheless, I believe this to be an improvement
+//! over [`async_scoped`], which blocks the thread until all child tasks have completed (making
+//! nesting challenging). One future possibility is implementing some form of work stealing, but it
+//! has been left out for now.
+//!
+//! # The API in a nutshell
+//!
+//! ```rust
+//! # use async_scoped_task::{scope, TokioExecutor};
+//! # async {
+//! let s = scope::<TokioExecutor, _, _, _>(|s| async {
+//!     // `spawn` takes the spawner by value, and then returns the very same spawner,
+//!     // preventing scoped tasks from spawning nested scoped tasks directly. Creating an
+//!     // innner scope should still be fine.
+//!     let mut s = s;
+//!     let mut tasks = Vec::new();
+//!     for _ in 0..50 {
+//!         let (spawner, task) = s.spawn(async {
+//!             // Here we can borrow from the surrounding scope
+//!         });
+//!         tasks.push(task);
+//!         s = spawner;
+//!     }
+//!     // Also here
+//!     for task in tasks {
+//!         let _retval = task.await;
+//!     }
+//!     // Any tasks that haven't finished yet will be cancelled once we return from the parent
+//!     // future.
+//!     "Stuff returned here is passed along"
+//! });
+//! // This is where stuff actually happens. The "evil fan-out" example given in tmandry's post
+//! // wouldn't break anything here, since the scoped only run while the scope is being polled.
+//! let output = s.await;
+//! # };
+//! ```
+//!
+//! # A note on (possibly) dangling references
+//!
+//! Partway through trying to write this library, I discovered that when you get a reference to a
+//! type, that type needs to contain no dangling references, unless the potentially dangling
+//! references (or types containing such references) are appropriately wrapped. The
+//! [`maybe_dangling`] crate provides one such set of wrapping types (which admittedly derive their
+//! power from [`MaybeUninit`]). As I understand it, the standard library will at some point give
+//! us the same ability, but until then using this crate seems like the way to do it. The following
+//! links should provide some context on this crate and why our usage of it here should be safe:
+//!
+//! - The implementation of [`std::thread::Scope::spawn`]:
+//!   [`spawn_unchecked_`](https://github.com/rust-lang/rust/blob/45ca53f9d867087fdf8fa7371b9f4f8b38a01a41/library/std/src/thread/mod.rs#L547-L569)
+//! - [rust-lang/rust#101983](https://github.com/rust-lang/rust/issues/101983)
+//! - [rust-lang/rfcs#3336](https://github.com/rust-lang/rfcs/pull/3336)
+//!
+//! # A last note
+//!
+//! While I'm relatively confident that the ideas underpinning this library are sound, my
+//! implementation may be less so. I'd be very happy to have someone else have a look at it.
+//!
+//! [`async_scoped`]: https://docs.rs/async-scoped
+//! [`maybe_dangling`]: https://docs.rs/maybe_dangling
+//! [`MaybeUninit`]: std::mem::MaybeUninit
 use std::{
     any::Any,
     future::Future,
@@ -19,7 +140,7 @@ use slab::Slab;
 
 use lock::{TicketRwLock, TicketRwLockWriteHandle};
 
-/// An executor capable of paralell execution.
+/// An executor capable of parallel execution.
 ///
 /// If [`Executor::spawn`] ends up spawning futures onto a non-multithreaded executor, your program
 /// may deadlock.
@@ -32,6 +153,7 @@ pub trait Executor {
         T: Send + 'static;
 }
 
+/// A handle we can use to abort a task.
 pub trait TaskHandle {
     fn abort(&self);
 }
@@ -103,6 +225,7 @@ where
     done: bool,
 }
 
+/// The main entrypoint of this library.
 #[must_use = "Must .await the Scope in order to make progress in subtasks"]
 pub fn scope<'env, 'scope, Ex, F, Fut, T>(f: F) -> Scope<'scope, Ex, Fut, T>
 where
