@@ -6,6 +6,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     pin::Pin,
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, TryRecvError},
         Arc, Mutex, Weak,
     },
@@ -37,6 +38,7 @@ pub trait TaskHandle {
 
 pub struct ScopedTaskSpawner<'scope, 'env: 'scope> {
     _phantom: PhantomData<&'scope &'env ()>,
+    scope_entered: Arc<AtomicBool>,
     spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }
 
@@ -46,6 +48,7 @@ where
     Ex: Executor,
 {
     _phantom: PhantomData<&'scope ()>,
+    scope_entered: Arc<AtomicBool>,
     #[pin]
     fut: F,
     fut_output: Option<T>,
@@ -110,16 +113,19 @@ where
     T: Send,
 {
     let (tx, rx) = mpsc::channel();
-    let scope = ScopedTaskSpawner::new(tx);
-    Scope::new(f(scope), rx)
+    let scope_entered = Arc::new(AtomicBool::new(false));
+    let scope = ScopedTaskSpawner::new(scope_entered.clone(), tx);
+    Scope::new(scope_entered, f(scope), rx)
 }
 
 impl<'scope, 'env> ScopedTaskSpawner<'scope, 'env> {
     fn new(
+        scope_entered: Arc<AtomicBool>,
         spawn_tx: mpsc::Sender<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     ) -> ScopedTaskSpawner<'scope, 'env> {
         Self {
             _phantom: PhantomData,
+            scope_entered,
             spawn_tx,
         }
     }
@@ -131,6 +137,9 @@ impl<'scope, 'env> ScopedTaskSpawner<'scope, 'env> {
         F: Future<Output = T> + Send + 'scope,
         T: Send + 'scope,
     {
+        if !self.scope_entered.load(Ordering::Acquire) {
+            panic!("Tried spawning a task before entering the parent future");
+        }
         let (tx, ret_rx) = mpsc::channel();
         // TODO: Find something better than this
         let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
@@ -168,6 +177,7 @@ where
     Ex: Executor,
 {
     fn new(
+        scope_entered: Arc<AtomicBool>,
         fut: F,
         spawn_rx: mpsc::Receiver<ManuallyDrop<Box<dyn Future<Output = ()> + Send + 'static>>>,
     ) -> Self {
@@ -183,6 +193,7 @@ where
         });
         Self {
             _phantom: PhantomData,
+            scope_entered,
             fut,
             fut_output: None,
             shared: Arc::new(shared),
@@ -207,6 +218,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        this.scope_entered.store(true, Ordering::Release);
         // The lock can only be poisoned in the current scope.
         let shared = this.shared_write.write(this.shared);
         shared.scope_waker = Some(cx.waker().clone());
@@ -677,6 +689,21 @@ mod tests {
             pin!(fut);
             for _ in 0..5 {
                 let _ = poll!(fut.as_mut());
+            }
+        });
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_early_spawn() {
+        let foo = String::new();
+        let _s = scope::<TokioExecutor, _, _, _>(|s| {
+            // Spawning a task here will panic
+            let (_s, _) = s.spawn(async {
+                let _foo = &foo;
+            });
+            async {
+                let _foo = &foo;
             }
         });
     }
