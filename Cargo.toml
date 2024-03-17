@@ -11,3 +11,4 @@ tokio = { version = "1.36.0", features = ["rt-multi-thread", "macros"] }
 maybe-dangling = "0.1.1"
 pin-project = "1.1.5"
 slab = "0.4.9"
+tokio = { version = "1.36.0", features = ["rt"] }

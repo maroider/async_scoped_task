@@ -556,30 +556,30 @@ mod lock {
     }
 }
 
+pub struct TokioExecutor {}
+impl Executor for TokioExecutor {
+    type TaskHandle<T> = tokio::task::JoinHandle<T>;
+
+    fn spawn<F, T>(fut: F) -> Self::TaskHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn(fut)
+    }
+}
+impl<T> TaskHandle for tokio::task::JoinHandle<T> {
+    fn abort(&self) {
+        tokio::task::JoinHandle::<T>::abort(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use futures::poll;
     use tokio::{join, pin};
-
-    struct TokioExecutor {}
-    impl Executor for TokioExecutor {
-        type TaskHandle<T> = tokio::task::JoinHandle<T>;
-
-        fn spawn<F, T>(fut: F) -> Self::TaskHandle<T>
-        where
-            F: Future<Output = T> + Send + 'static,
-            T: Send + 'static,
-        {
-            tokio::task::spawn(fut)
-        }
-    }
-    impl<T> TaskHandle for tokio::task::JoinHandle<T> {
-        fn abort(&self) {
-            tokio::task::JoinHandle::<T>::abort(self)
-        }
-    }
 
     fn scoped<'env, 'scope, F, T>(
         data: &'env mut [i32],
