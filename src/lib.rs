@@ -126,6 +126,7 @@ use std::{
     mem,
     panic::{self, AssertUnwindSafe},
     pin::Pin,
+    ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, TryRecvError},
@@ -194,14 +195,21 @@ where
     Ex: Executor,
 {
     tasks: Slab<Mutex<TaskState<Ex::TaskHandle<()>>>>,
-    // This is only an `Option` because of delayed initialization. If we wanted to, we could
-    // initialize it with a no-op waker, but I can't be arsed since there's no stable way to do
-    // it in the standard library.
-    scope_waker: Option<Waker>,
+    scope_waker: Waker,
     task_wake_tx: mpsc::Sender<usize>,
     task_done_tx: mpsc::Sender<usize>,
     task_panic_tx: mpsc::Sender<Box<dyn Any + Send + 'static>>,
 }
+
+static NOOP_WAKER: Waker = unsafe {
+    const RAW_NOOP_WAKER: RawWaker = {
+        RawWaker::new(
+            ptr::null(),
+            &RawWakerVTable::new(|_| RAW_NOOP_WAKER, |_| {}, |_| {}, |_| {}),
+        )
+    };
+    Waker::from_raw(RAW_NOOP_WAKER)
+};
 
 struct TaskState<H> {
     // SAFETY: Accessing this field from a runner is UB if the non-'static data this future borrows
@@ -309,7 +317,7 @@ where
         let (task_panic_tx, task_panic_rx) = mpsc::channel();
         let (shared, shared_write) = TicketRwLock::new(SharedState {
             tasks: Slab::new(),
-            scope_waker: None,
+            scope_waker: NOOP_WAKER.clone(),
             task_wake_tx,
             task_done_tx,
             task_panic_tx,
@@ -344,7 +352,7 @@ where
         this.scope_entered.store(true, Ordering::Release);
         // The lock can only be poisoned in the current scope.
         let shared = this.shared_write.write(this.shared);
-        shared.scope_waker = Some(cx.waker().clone());
+        shared.scope_waker = cx.waker().clone();
 
         let mut wakers = Vec::new();
         for idx in this.task_wake_rx.try_iter() {
@@ -484,7 +492,7 @@ where
                     future
                         .as_mut()
                         .poll(&mut Context::from_waker(&scoped_task_waker(
-                            scope.scope_waker.as_ref().unwrap().clone(),
+                            scope.scope_waker.clone(),
                             scope.task_wake_tx.clone(),
                             self.idx,
                         )))
